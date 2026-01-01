@@ -15,7 +15,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # Токен бота
-TOKEN = "7979153629:AAFPh1qGUDzsX8ljP3MZ2ROAQ9vA_XtkBdE"
+TOKEN = "7979153629:AAGbAFQy71fYB5Lp6FGlQ3pf4KY6HdMueIU"
 
 # ID администратора
 ADMIN_ID = 7313407194
