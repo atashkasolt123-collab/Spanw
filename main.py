@@ -3,7 +3,7 @@ import random
 import re
 import asyncio
 from typing import Dict, List, Tuple, Set, Any
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, Dice
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes, MessageHandler, filters
 from datetime import datetime
 
@@ -15,22 +15,39 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # Токен бота
-TOKEN = "7979153629:AAGbAFQy71fYB5Lp6FGlQ3pf4KY6HdMueIU"
+TOKEN = "7979153629:AAFPh1qGUDzsX8ljP3MZ2ROAQ9vA_XtkBdE"
 
 # ID администратора
 ADMIN_ID = 7313407194
+ADMIN_USERNAME = "@pensiya_get"
+
+# Минимальные суммы
+MIN_DEPOSIT = 25  # Минимальное пополнение
+MIN_WITHDRAWAL = 300 # Минимальный вывод
+MIN_TRANSFER_AMOUNT = 10  # Минимальный перевод между пользователями
 
 # Глобальные счетчики
 game_counter = 0
 games_history: Dict[int, Dict] = {}
 
 # Хранилище данных
-user_data: Dict[int, Dict] = {}
+user_data: Dict[int, Dict] = {
+    ADMIN_ID: {  # Предварительно добавляем администратора
+        "balance": 0,
+        "username": ADMIN_USERNAME,
+        "first_name": "Администратор",
+        "deposits": [],
+        "withdrawals": []
+    }
+}
 game_data: Dict[int, Dict] = {}
 user_bets: Dict[int, int] = {}
 
+# Хранилище заявок на вывод
+withdrawal_requests: Dict[int, Dict] = {}
+
 # Константы игры
-INITIAL_BALANCE = 1000
+INITIAL_BALANCE = 25
 MIN_BET = 25
 GRID_SIZE = 5
 TOTAL_CELLS = GRID_SIZE * GRID_SIZE
@@ -39,7 +56,7 @@ MAX_MINES = 2
 
 # Множители
 MULTIPLIERS = {
-    2: 1.12
+    2: 1.07
 }
 
 # Множители для игры в кубы
@@ -51,7 +68,6 @@ DICE_MULTIPLIERS = {
 
 # Комиссия за перевод (в процентах)
 TRANSFER_FEE_PERCENT = 0  # 0% комиссия
-MIN_TRANSFER_AMOUNT = 10  # Минимальная сумма перевода
 
 # Обработчик команды /start
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -62,22 +78,23 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         user_data[user_id] = {
             "balance": INITIAL_BALANCE, 
             "username": update.effective_user.username or update.effective_user.first_name,
-            "first_name": update.effective_user.first_name
+            "first_name": update.effective_user.first_name,
+            "deposits": [],
+            "withdrawals": []
         }
     
     keyboard = [
         [InlineKeyboardButton("Играть", callback_data="play_menu")],
         [InlineKeyboardButton("Баланс", callback_data="balance")],
-        [InlineKeyboardButton("Игровые чаты", callback_data="chats")]
+        [InlineKeyboardButton("Вывести средства", callback_data="withdraw_menu")],
+        [InlineKeyboardButton("Пополнить баланс", callback_data="deposit")]
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
     
     welcome_text = f"""
-<b>Добро пожаловать в Spindja Casino!</b>
+<b>🎰 Добро пожаловать в Spindja Casino!</b>
 
 Мы рады видеть вас в нашем казино!
-
-Подписывайтесь на наш канал @spindja чтобы следить за новостями и конкурсами.
 
 🎮 <b>Ваш баланс:</b> {user_data[user_id]['balance']}₽
 
@@ -109,10 +126,21 @@ async def balance_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         user_data[user_id] = {
             "balance": INITIAL_BALANCE, 
             "username": update.effective_user.username or update.effective_user.first_name,
-            "first_name": update.effective_user.first_name
+            "first_name": update.effective_user.first_name,
+            "deposits": [],
+            "withdrawals": []
         }
     
+    await show_balance_message(update.message, user_id)
+
+async def show_balance_message(message, user_id: int):
+    """Показывает баланс пользователя"""
     balance = user_data[user_id]["balance"]
+    
+    # Рассчитываем общие суммы
+    total_deposits = sum(dep["amount"] for dep in user_data[user_id].get("deposits", []))
+    total_withdrawals = sum(wd["amount"] for wd in user_data[user_id].get("withdrawals", []))
+    
     saved_bet = user_bets.get(user_id, None)
     bet_info = f"\n💾 Сохраненная ставка: {saved_bet}₽" if saved_bet else ""
     
@@ -121,9 +149,15 @@ async def balance_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
 📊 Текущий баланс: <b>{balance}₽</b>{bet_info}
 
-🎮 <u>Минимальные ставки:</u>
+📈 <u>Статистика:</u>
+• Всего пополнено: <b>{total_deposits}₽</b>
+• Всего выведено: <b>{total_withdrawals}₽</b>
+
+🎮 <u>Минимальные суммы:</u>
 • Все игры: {MIN_BET}₽
 • Переводы: {MIN_TRANSFER_AMOUNT}₽
+• Пополнение: от {MIN_DEPOSIT}₽
+• Вывод: от {MIN_WITHDRAWAL}₽
 
 🎲 <u>Доступные игры:</u>
 • <b>Мины</b> - 2 мины, множитель 1.12x
@@ -135,12 +169,13 @@ async def balance_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     
     keyboard = [
         [InlineKeyboardButton("Пополнить баланс", callback_data="deposit")],
+        [InlineKeyboardButton("Вывести средства", callback_data="withdraw_menu")],
         [InlineKeyboardButton("Меню игр", callback_data="play_menu")],
-        [InlineKeyboardButton("Игровые чаты", callback_data="chats")]
+        [InlineKeyboardButton("Назад", callback_data="back_to_main")]
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
     
-    await update.message.reply_text(
+    await message.reply_text(
         balance_text,
         parse_mode='HTML',
         reply_markup=reply_markup
@@ -156,7 +191,9 @@ async def pay_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         user_data[user_id] = {
             "balance": INITIAL_BALANCE, 
             "username": username,
-            "first_name": update.effective_user.first_name
+            "first_name": update.effective_user.first_name,
+            "deposits": [],
+            "withdrawals": []
         }
     
     # Проверяем, является ли сообщение ответом на другое сообщение
@@ -230,7 +267,9 @@ async def pay_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             user_data[target_id] = {
                 "balance": INITIAL_BALANCE, 
                 "username": f"пользователь {target_id}",
-                "first_name": f"Пользователь {target_id}"
+                "first_name": f"Пользователь {target_id}",
+                "deposits": [],
+                "withdrawals": []
             }
     
     # Проверяем сумму перевода
@@ -353,7 +392,9 @@ async def process_dice_quick_bet(update: Update, context: ContextTypes.DEFAULT_T
         user_data[user_id] = {
             "balance": INITIAL_BALANCE, 
             "username": update.effective_user.username or update.effective_user.first_name,
-            "first_name": update.effective_user.first_name
+            "first_name": update.effective_user.first_name,
+            "deposits": [],
+            "withdrawals": []
         }
     
     # Если amount не передан, берем из аргументов
@@ -383,8 +424,11 @@ async def process_dice_quick_bet(update: Update, context: ContextTypes.DEFAULT_T
         )
         return
     
-    # Бросаем куб
-    dice_result = random.randint(1, 6)
+    # Бросаем куб через Telegram Dice
+    dice_message = await update.message.reply_dice(emoji="🎲")
+    dice_result = dice_message.dice.value
+    
+    await asyncio.sleep(2)  # Ждем пока анимация куба завершится
     
     # Определяем выигрыш
     win = False
@@ -581,10 +625,21 @@ async def givemoney(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             user_data[target_id] = {
                 "balance": INITIAL_BALANCE, 
                 "username": f"пользователь {target_id}",
-                "first_name": f"Пользователь {target_id}"
+                "first_name": f"Пользователь {target_id}",
+                "deposits": [],
+                "withdrawals": []
             }
         
         user_data[target_id]["balance"] += amount
+        
+        # Добавляем запись о пополнении
+        deposit_record = {
+            "amount": amount,
+            "date": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "admin_id": user_id,
+            "type": "администратор"
+        }
+        user_data[target_id]["deposits"].append(deposit_record)
         
         await update.message.reply_text(
             f"✅ Баланс пользователя <code>{target_id}</code> пополнен на <b>{amount}₽</b>.\n"
@@ -596,6 +651,66 @@ async def givemoney(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             await context.bot.send_message(
                 chat_id=target_id,
                 text=f"🎉 Ваш баланс пополнен на <b>{amount}₽</b> администратором!\n"
+                     f"Новый баланс: <b>{user_data[target_id]['balance']}₽</b>",
+                parse_mode='HTML'
+            )
+        except:
+            pass
+            
+    except ValueError:
+        await update.message.reply_text("❌ Неверный формат ID или суммы.")
+
+# Команда /delbalance для администратора
+async def delbalance(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Снимает баланс с пользователя (только для администратора)"""
+    user_id = update.effective_user.id
+    
+    if user_id != ADMIN_ID:
+        await update.message.reply_text("❌ У вас нет прав для выполнения этой команды.")
+        return
+    
+    if len(context.args) != 2:
+        await update.message.reply_text(
+            "❌ Неправильный формат команды.\n"
+            "Используйте: <code>/delbalance ID_пользователя сумма</code>\n"
+            "Например: <code>/delbalance 123456789 1000</code>",
+            parse_mode='HTML'
+        )
+        return
+    
+    try:
+        target_id = int(context.args[0])
+        amount = int(context.args[1])
+        
+        if amount <= 0:
+            await update.message.reply_text("❌ Сумма должна быть положительной.")
+            return
+        
+        if target_id not in user_data:
+            await update.message.reply_text(f"❌ Пользователь с ID {target_id} не найден.")
+            return
+        
+        if user_data[target_id]["balance"] < amount:
+            await update.message.reply_text(
+                f"❌ У пользователя недостаточно средств.\n"
+                f"Баланс пользователя: {user_data[target_id]['balance']}₽\n"
+                f"Сумма списания: {amount}₽",
+                parse_mode='HTML'
+            )
+            return
+        
+        user_data[target_id]["balance"] -= amount
+        
+        await update.message.reply_text(
+            f"✅ С пользователя <code>{target_id}</code> списано <b>{amount}₽</b>.\n"
+            f"Новый баланс: <b>{user_data[target_id]['balance']}₽</b>",
+            parse_mode='HTML'
+        )
+        
+        try:
+            await context.bot.send_message(
+                chat_id=target_id,
+                text=f"⚠️ С вашего баланса списано <b>{amount}₽</b> администратором!\n"
                      f"Новый баланс: <b>{user_data[target_id]['balance']}₽</b>",
                 parse_mode='HTML'
             )
@@ -621,10 +736,6 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         await start_dice_from_chat(update, user_id)
         return
     
-    # Проверяем, не является ли сообщение командой
-    if text.startswith('/'):
-        return
-    
     # Проверяем на наличие суммы для ставки
     pattern = r'(\d+)\s*(?:₽|руб|рублей|р)'
     match = re.search(pattern, text)
@@ -632,23 +743,6 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
     if match:
         await handle_bet_message(update, user_id, match)
         return
-    
-    # Если ничего не распознали, предлагаем помощь
-    await update.message.reply_text(
-        "🤔 Не понял ваше сообщение.\n\n"
-        "<u>Доступные команды:</u>\n"
-        "• <code>/balance</code> / <code>/bal</code> / <code>/b</code> - показать баланс\n"
-        "• <code>/pay сумма</code> - перевести другу\n"
-        "• Напишите <code>мины</code> - игра в мины\n"
-        "• Напишите <code>кубы</code> - игра в кубы\n"
-        "• <code>/chet сумма</code> - ставка на чет (2,4,6) - x2\n"
-        "• <code>/nechet сумма</code> - ставка на нечет (1,3,5) - x2\n"
-        "• <code>/number число сумма</code> - ставка на число (1-6) - x6\n"
-        "• <code>/more сумма</code> - ставка на больше (4-6) - x2\n"
-        "• <code>/less сумма</code> - ставка на меньше (1-3) - x2\n"
-        "• Напишите сумму с ₽ - установить ставку",
-        parse_mode='HTML'
-    )
 
 # Запуск игры "Кубы" из чата
 async def start_dice_from_chat(update: Update, user_id: int) -> None:
@@ -657,7 +751,9 @@ async def start_dice_from_chat(update: Update, user_id: int) -> None:
         user_data[user_id] = {
             "balance": INITIAL_BALANCE, 
             "username": update.effective_user.username or update.effective_user.first_name,
-            "first_name": update.effective_user.first_name
+            "first_name": update.effective_user.first_name,
+            "deposits": [],
+            "withdrawals": []
         }
     
     balance = user_data[user_id]["balance"]
@@ -713,7 +809,7 @@ async def deposit_menu(query, user_id):
     balance = user_data[user_id]["balance"]
     
     keyboard = [
-        [InlineKeyboardButton("Обратиться к администратору", callback_data="contact_admin")],
+        [InlineKeyboardButton(f"Связаться с {ADMIN_USERNAME}", url=f"https://t.me/{ADMIN_USERNAME[1:]}")],
         [InlineKeyboardButton("Назад", callback_data="balance")]
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
@@ -723,12 +819,17 @@ async def deposit_menu(query, user_id):
 
 💳 Ваш текущий баланс: <b>{balance}₽</b>
 
-<u>Способы пополнения:</u>
-1. <b>Администратор</b> - обратитесь к администратору через кнопку ниже
-2. <b>Перевод от друга</b> - попросите друга перевести вам средства через команду <code>/pay</code>
+<u>Требования к пополнению:</u>
+• Минимальная сумма: <b>{MIN_DEPOSIT}₽</b>
+• Пополнение через администратора: {ADMIN_USERNAME}
 
-📞 <b>Для пополнения баланса:</b>
-Нажмите кнопку ниже чтобы связаться с администратором или попросите друга отправить вам перевод.
+📞 <b>Инструкция по пополнению:</b>
+1. Нажмите кнопку ниже для связи с администратором
+2. Укажите ваш ID: <code>{user_id}</code>
+3. Укажите желаемую сумму пополнения
+4. Дождитесь подтверждения от администратора
+
+⏱️ Пополнение происходит в течение 5-15 минут после подтверждения.
     """
     
     await query.edit_message_text(
@@ -737,39 +838,40 @@ async def deposit_menu(query, user_id):
         reply_markup=reply_markup
     )
 
-# Связь с администратором
-async def contact_admin(query, user_id):
-    """Связь с администратором"""
-    username = user_data[user_id].get("username", "Пользователь")
+# Меню вывода средств
+async def withdraw_menu(query, user_id):
+    """Меню вывода средств"""
     balance = user_data[user_id]["balance"]
     
     keyboard = [
-        [InlineKeyboardButton("Назад", callback_data="deposit")]
+        [InlineKeyboardButton(f"Связаться с {ADMIN_USERNAME}", url=f"https://t.me/{ADMIN_USERNAME[1:]}")],
+        [InlineKeyboardButton("Назад", callback_data="balance")]
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
     
-    contact_text = f"""
-<b>📞 Связь с администратором</b>
+    withdraw_text = f"""
+<b>💸 Вывод средств</b>
 
-👤 Ваш профиль:
-• ID: <code>{user_id}</code>
-• Имя: {username}
-• Баланс: {balance}₽
+💳 Ваш текущий баланс: <b>{balance}₽</b>
 
-<u>Администратор:</u>
-• ID: <code>{ADMIN_ID}</code>
+<u>Требования к выводу:</u>
+• Минимальная сумма вывода: <b>{MIN_WITHDRAWAL}₽</b>
+• Вывод через администратора: {ADMIN_USERNAME}
 
-<u>Инструкция:</u>
-1. Напишите администратору в личные сообщения
+📋 <b>Инструкция по выводу:</b>
+1. Нажмите кнопку ниже для связи с администратором
 2. Укажите ваш ID: <code>{user_id}</code>
-3. Укажите сумму пополнения
-4. Ожидайте ответа
+3. Укажите сумму вывода (от {MIN_WITHDRAWAL}₽)
+4. Укажите реквизиты для перевода
+5. Дождитесь подтверждения и получения средств
 
-⏱️ Обычно ответ поступает в течение 5-15 минут.
+⏱️ Вывод происходит в течение 5-30 минут после подтверждения.
+
+⚠️ <b>Внимание:</b> Средства выводятся только на карты РФ или через другие доступные способы, согласованные с администратором.
     """
     
     await query.edit_message_text(
-        text=contact_text,
+        text=withdraw_text,
         parse_mode='HTML',
         reply_markup=reply_markup
     )
@@ -1025,8 +1127,19 @@ async def dice_roll(query, user_id):
         await query.answer("Недостаточно средств!")
         return
     
-    # Бросаем куб
-    dice_result = random.randint(1, 6)
+    # Бросаем куб через Telegram Dice
+    try:
+        dice_message = await query.message.reply_dice(emoji="🎲")
+        dice_result = dice_message.dice.value
+        
+        await asyncio.sleep(2)  # Ждем пока анимация куба завершится
+        
+    except Exception as e:
+        logger.error(f"Ошибка при броске куба: {e}")
+        # Если не удалось отправить анимацию, используем случайное число
+        dice_result = random.randint(1, 6)
+        await query.message.reply_text(f"🎲 Бросаем куб... Выпало: {dice_result}")
+        await asyncio.sleep(1)
     
     # Определяем выигрыш
     win = False
@@ -1156,7 +1269,9 @@ async def start_mines_from_chat(update: Update, user_id: int) -> None:
         user_data[user_id] = {
             "balance": INITIAL_BALANCE, 
             "username": update.effective_user.username or update.effective_user.first_name,
-            "first_name": update.effective_user.first_name
+            "first_name": update.effective_user.first_name,
+            "deposits": [],
+            "withdrawals": []
         }
     
     balance = user_data[user_id]["balance"]
@@ -1274,7 +1389,9 @@ async def handle_bet_message(update: Update, user_id: int, match: re.Match) -> N
         user_data[user_id] = {
             "balance": INITIAL_BALANCE, 
             "username": update.effective_user.username or update.effective_user.first_name,
-            "first_name": update.effective_user.first_name
+            "first_name": update.effective_user.first_name,
+            "deposits": [],
+            "withdrawals": []
         }
     
     user_bets[user_id] = amount
@@ -1296,12 +1413,15 @@ async def show_balance(query, user_id):
         user_data[user_id] = {
             "balance": INITIAL_BALANCE, 
             "username": query.from_user.username or query.from_user.first_name,
-            "first_name": query.from_user.first_name
+            "first_name": query.from_user.first_name,
+            "deposits": [],
+            "withdrawals": []
         }
     
     balance = user_data[user_id]["balance"]
     keyboard = [
         [InlineKeyboardButton("Пополнить баланс", callback_data="deposit")],
+        [InlineKeyboardButton("Вывести средства", callback_data="withdraw_menu")],
         [InlineKeyboardButton("Назад", callback_data="back_to_main")]
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
@@ -1309,10 +1429,18 @@ async def show_balance(query, user_id):
     saved_bet = user_bets.get(user_id, None)
     bet_info = f"\n💾 Сохраненная ставка: {saved_bet}₽" if saved_bet else ""
     
+    # Рассчитываем общие суммы
+    total_deposits = sum(dep["amount"] for dep in user_data[user_id].get("deposits", []))
+    total_withdrawals = sum(wd["amount"] for wd in user_data[user_id].get("withdrawals", []))
+    
     balance_text = f"""
 <b>Ваш баланс</b>
 
 💰 Баланс: {balance} ₽{bet_info}
+
+📈 <u>Статистика:</u>
+• Всего пополнено: <b>{total_deposits}₽</b>
+• Всего выведено: <b>{total_withdrawals}₽</b>
 
 🎮 Минимальная ставка: {MIN_BET} ₽
 
@@ -1330,6 +1458,200 @@ async def show_balance(query, user_id):
         reply_markup=reply_markup
     )
 
+# Главный обработчик кнопок
+async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Обрабатывает нажатия на кнопки"""
+    query = update.callback_query
+    await query.answer()
+    
+    user_id = query.from_user.id
+    
+    if user_id not in user_data:
+        user_data[user_id] = {
+            "balance": INITIAL_BALANCE, 
+            "username": query.from_user.username or query.from_user.first_name,
+            "first_name": query.from_user.first_name,
+            "deposits": [],
+            "withdrawals": []
+        }
+    
+    # Сохраняем имя пользователя
+    user_data[user_id]["username"] = query.from_user.username or query.from_user.first_name
+    
+    # Обработка основных команд
+    if query.data == "play_menu":
+        await play_menu(query, user_id)
+        return
+    
+    elif query.data == "balance":
+        await show_balance(query, user_id)
+        return
+    
+    elif query.data == "deposit":
+        await deposit_menu(query, user_id)
+        return
+    
+    elif query.data == "withdraw_menu":
+        await withdraw_menu(query, user_id)
+        return
+    
+    elif query.data == "chats":
+        keyboard = [
+            [InlineKeyboardButton("Перейти в чат", url="https://t.me/+fVJwoK3brgU0NmMy")],
+            [InlineKeyboardButton("Назад", callback_data="back_to_main")]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        chats_text = """
+<b>Игровые чаты</b>
+
+Присоединяйтесь к нашему сообществу!
+        """
+        
+        await query.edit_message_text(
+            text=chats_text,
+            parse_mode='HTML',
+            reply_markup=reply_markup
+        )
+        return
+    
+    elif query.data == "back_to_main":
+        keyboard = [
+            [InlineKeyboardButton("Играть", callback_data="play_menu")],
+            [InlineKeyboardButton("Баланс", callback_data="balance")],
+            [InlineKeyboardButton("Вывести средства", callback_data="withdraw_menu")],
+            [InlineKeyboardButton("Пополнить баланс", callback_data="deposit")]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        welcome_text = """
+<b>🎰 Добро пожаловать в Spindja Casino!</b>
+
+<u>Быстрые команды:</u>
+• <code>/balance</code> / <code>/bal</code> / <code>/b</code> - показать баланс
+• <code>/pay сумма</code> - перевести другу
+• Напишите <code>мины</code> - игра в мины (2 мины)
+• Напишите <code>кубы</code> - игра в кубы
+• <code>/chet сумма</code> - ставка на чет (2,4,6) - x2
+• <code>/nechet сумма</code> - ставка на нечет (1,3,5) - x2
+• <code>/number число сумма</code> - ставка на число (1-6) - x6
+• <code>/more сумма</code> - ставка на больше (4-6) - x2
+• <code>/less сумма</code> - ставка на меньше (1-3) - x2
+        """
+        
+        await query.edit_message_text(
+            text=welcome_text,
+            parse_mode='HTML',
+            reply_markup=reply_markup
+        )
+        return
+    
+    # Игра в мины
+    elif query.data == "game_mines":
+        await mines_setup(query, user_id)
+        return
+    
+    elif query.data == "change_bet":
+        await change_bet(query, user_id)
+        return
+    
+    elif query.data == "mines_info":
+        await mines_info(query, user_id)
+        return
+    
+    elif query.data.startswith("set_bet_"):
+        bet = int(query.data.split("_")[2])
+        if bet <= user_data[user_id]["balance"]:
+            game_data[user_id]["bet"] = bet
+            user_bets[user_id] = bet
+        await mines_setup(query, user_id)
+        return
+    
+    elif query.data == "start_mines_game":
+        if user_data[user_id]["balance"] < game_data[user_id]["bet"]:
+            await query.answer("Недостаточно средств на балансе!")
+            return
+        else:
+            await play_mines_game(query, user_id)
+            return
+    
+    elif query.data.startswith("cell_"):
+        cell_idx = int(query.data.split("_")[1])
+        await handle_cell_click(query, user_id, cell_idx)
+        return
+    
+    elif query.data == "cashout":
+        await handle_cashout(query, user_id)
+        return
+    
+    elif query.data.startswith("cell_opened_"):
+        await query.answer("Эта ячейка уже открыта!")
+        return
+    
+    # Игра в кубы
+    elif query.data == "game_dice":
+        await dice_menu(query, user_id)
+        return
+    
+    elif query.data == "dice_even_odd":
+        await dice_even_odd(query, user_id)
+        return
+    
+    elif query.data == "dice_number":
+        await dice_number(query, user_id)
+        return
+    
+    elif query.data == "dice_high_low":
+        await dice_high_low(query, user_id)
+        return
+    
+    elif query.data == "dice_bet_even":
+        await process_dice_bet(query, user_id, "even")
+        return
+    
+    elif query.data == "dice_bet_odd":
+        await process_dice_bet(query, user_id, "odd")
+        return
+    
+    elif query.data.startswith("dice_bet_num_"):
+        number = query.data.split("_")[3]
+        await process_dice_bet(query, user_id, "number", number)
+        return
+    
+    elif query.data == "dice_bet_high":
+        await process_dice_bet(query, user_id, "high")
+        return
+    
+    elif query.data == "dice_bet_low":
+        await process_dice_bet(query, user_id, "low")
+        return
+    
+    elif query.data == "dice_change_bet":
+        await dice_change_bet(query, user_id)
+        return
+    
+    elif query.data.startswith("dice_set_bet_"):
+        bet = int(query.data.split("_")[3])
+        if bet <= user_data[user_id]["balance"]:
+            # Сохраняем ставку для кубов
+            user_bets[user_id] = bet
+            if user_id in game_data and "bet_type" in game_data[user_id]:
+                game_data[user_id]["amount"] = bet
+                # Возвращаемся к соответствующему экрану
+                bet_type = game_data[user_id]["bet_type"]
+                bet_value = game_data[user_id].get("bet_value", "")
+                if bet_value:
+                    await process_dice_bet(query, user_id, bet_type, bet_value)
+                else:
+                    await process_dice_bet(query, user_id, bet_type)
+            else:
+                await dice_menu(query, user_id)
+        return
+    
+    elif query.data == "dice_roll":
+        await dice_roll(query, user_id)
+        return
+
 # Главное меню игр
 async def play_menu(query, user_id):
     """Меню выбора игры"""
@@ -1337,7 +1659,9 @@ async def play_menu(query, user_id):
         user_data[user_id] = {
             "balance": INITIAL_BALANCE, 
             "username": query.from_user.username or query.from_user.first_name,
-            "first_name": query.from_user.first_name
+            "first_name": query.from_user.first_name,
+            "deposits": [],
+            "withdrawals": []
         }
     
     keyboard = [
@@ -1382,7 +1706,9 @@ async def mines_setup(query, user_id):
         user_data[user_id] = {
             "balance": INITIAL_BALANCE, 
             "username": query.from_user.username or query.from_user.first_name,
-            "first_name": query.from_user.first_name
+            "first_name": query.from_user.first_name,
+            "deposits": [],
+            "withdrawals": []
         }
     
     balance = user_data[user_id]["balance"]
@@ -1682,197 +2008,6 @@ async def handle_cashout(query, user_id):
         reply_markup=reply_markup
     )
 
-# Главный обработчик кнопок
-async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Обрабатывает нажатия на кнопки"""
-    query = update.callback_query
-    await query.answer()
-    
-    user_id = query.from_user.id
-    
-    if user_id not in user_data:
-        user_data[user_id] = {
-            "balance": INITIAL_BALANCE, 
-            "username": query.from_user.username or query.from_user.first_name,
-            "first_name": query.from_user.first_name
-        }
-    
-    # Сохраняем имя пользователя
-    user_data[user_id]["username"] = query.from_user.username or query.from_user.first_name
-    
-    # Обработка основных команд
-    if query.data == "play_menu":
-        await play_menu(query, user_id)
-        return
-    
-    elif query.data == "balance":
-        await show_balance(query, user_id)
-        return
-    
-    elif query.data == "deposit":
-        await deposit_menu(query, user_id)
-        return
-    
-    elif query.data == "contact_admin":
-        await contact_admin(query, user_id)
-        return
-    
-    elif query.data == "chats":
-        keyboard = [
-            [InlineKeyboardButton("Перейти в чат", url="https://t.me/+fVJwoK3brgU0NmMy")],
-            [InlineKeyboardButton("Назад", callback_data="back_to_main")]
-        ]
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        
-        chats_text = """
-<b>Игровые чаты</b>
-
-Присоединяйтесь к нашему сообществу!
-        """
-        
-        await query.edit_message_text(
-            text=chats_text,
-            parse_mode='HTML',
-            reply_markup=reply_markup
-        )
-        return
-    
-    elif query.data == "back_to_main":
-        keyboard = [
-            [InlineKeyboardButton("Играть", callback_data="play_menu")],
-            [InlineKeyboardButton("Баланс", callback_data="balance")],
-            [InlineKeyboardButton("Игровые чаты", callback_data="chats")]
-        ]
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        
-        welcome_text = """
-<b>Добро пожаловать в Spindja Casino!</b>
-
-<u>Быстрые команды:</u>
-• <code>/balance</code> / <code>/bal</code> / <code>/b</code> - показать баланс
-• <code>/pay сумма</code> - перевести другу
-• Напишите <code>мины</code> - игра в мины (2 мины)
-• Напишите <code>кубы</code> - игра в кубы
-• <code>/chet сумма</code> - ставка на чет (2,4,6) - x2
-• <code>/nechet сумма</code> - ставка на нечет (1,3,5) - x2
-• <code>/number число сумма</code> - ставка на число (1-6) - x6
-• <code>/more сумма</code> - ставка на больше (4-6) - x2
-• <code>/less сумма</code> - ставка на меньше (1-3) - x2
-        """
-        
-        await query.edit_message_text(
-            text=welcome_text,
-            parse_mode='HTML',
-            reply_markup=reply_markup
-        )
-        return
-    
-    # Игра в мины
-    elif query.data == "game_mines":
-        await mines_setup(query, user_id)
-        return
-    
-    elif query.data == "change_bet":
-        await change_bet(query, user_id)
-        return
-    
-    elif query.data == "mines_info":
-        await mines_info(query, user_id)
-        return
-    
-    elif query.data.startswith("set_bet_"):
-        bet = int(query.data.split("_")[2])
-        if bet <= user_data[user_id]["balance"]:
-            game_data[user_id]["bet"] = bet
-            user_bets[user_id] = bet
-        await mines_setup(query, user_id)
-        return
-    
-    elif query.data == "start_mines_game":
-        if user_data[user_id]["balance"] < game_data[user_id]["bet"]:
-            await query.answer("Недостаточно средств на балансе!")
-            return
-        else:
-            await play_mines_game(query, user_id)
-            return
-    
-    elif query.data.startswith("cell_"):
-        cell_idx = int(query.data.split("_")[1])
-        await handle_cell_click(query, user_id, cell_idx)
-        return
-    
-    elif query.data == "cashout":
-        await handle_cashout(query, user_id)
-        return
-    
-    elif query.data.startswith("cell_opened_"):
-        await query.answer("Эта ячейка уже открыта!")
-        return
-    
-    # Игра в кубы
-    elif query.data == "game_dice":
-        await dice_menu(query, user_id)
-        return
-    
-    elif query.data == "dice_even_odd":
-        await dice_even_odd(query, user_id)
-        return
-    
-    elif query.data == "dice_number":
-        await dice_number(query, user_id)
-        return
-    
-    elif query.data == "dice_high_low":
-        await dice_high_low(query, user_id)
-        return
-    
-    elif query.data == "dice_bet_even":
-        await process_dice_bet(query, user_id, "even")
-        return
-    
-    elif query.data == "dice_bet_odd":
-        await process_dice_bet(query, user_id, "odd")
-        return
-    
-    elif query.data.startswith("dice_bet_num_"):
-        number = query.data.split("_")[3]
-        await process_dice_bet(query, user_id, "number", number)
-        return
-    
-    elif query.data == "dice_bet_high":
-        await process_dice_bet(query, user_id, "high")
-        return
-    
-    elif query.data == "dice_bet_low":
-        await process_dice_bet(query, user_id, "low")
-        return
-    
-    elif query.data == "dice_change_bet":
-        await dice_change_bet(query, user_id)
-        return
-    
-    elif query.data.startswith("dice_set_bet_"):
-        bet = int(query.data.split("_")[3])
-        if bet <= user_data[user_id]["balance"]:
-            # Сохраняем ставку для кубов
-            user_bets[user_id] = bet
-            if user_id in game_data and "bet_type" in game_data[user_id]:
-                game_data[user_id]["amount"] = bet
-                # Возвращаемся к соответствующему экрану
-                bet_type = game_data[user_id]["bet_type"]
-                bet_value = game_data[user_id].get("bet_value", "")
-                if bet_value:
-                    await process_dice_bet(query, user_id, bet_type, bet_value)
-                else:
-                    await process_dice_bet(query, user_id, bet_type)
-            else:
-                await dice_menu(query, user_id)
-        return
-    
-    elif query.data == "dice_roll":
-        await dice_roll(query, user_id)
-        return
-
 # Изменение ставки
 async def change_bet(query, user_id):
     """Изменение ставки"""
@@ -1919,6 +2054,7 @@ def main() -> None:
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("givemoney", givemoney))
     application.add_handler(CommandHandler("game", game_command))
+    application.add_handler(CommandHandler("delbalance", delbalance))
     
     # Команды для баланса и переводов
     application.add_handler(CommandHandler("balance", balance_command))
@@ -1954,14 +2090,16 @@ def main() -> None:
     print("=" * 50)
     print("Бот запущен...")
     print("=" * 50)
-    print(f"Администратор: {ADMIN_ID}")
+    print(f"Администратор: {ADMIN_ID} ({ADMIN_USERNAME})")
     print("\n📊 Команды баланса:")
     print("• /balance / /bal / /b - показать баланс")
     print("• /pay сумма - перевести другу (ответом на сообщение)")
     print("• /pay ID сумма - перевести по ID пользователя")
+    print(f"• Пополнение: от {MIN_DEPOSIT}₽ через {ADMIN_USERNAME}")
+    print(f"• Вывод: от {MIN_WITHDRAWAL}₽ через {ADMIN_USERNAME}")
     print("\n🎮 Игры:")
-    print("• Напишите 'мины' - игра в мины")
-    print("• Напишите 'кубы' - игра в кубы")
+    print("• Напишите 'мины' - игра в мины (2 мины, x1.12)")
+    print("• Напишите 'кубы' - игра в кубы (анимированные кубики)")
     print("\n🎲 Быстрые ставки в Кубы:")
     print("• /chet сумма - ставка на чет (2,4,6) - x2")
     print("• /nechet сумма - ставка на нечет (1,3,5) - x2")
@@ -1970,6 +2108,7 @@ def main() -> None:
     print("• /less сумма - ставка на меньше (1-3) - x2")
     print("\n⚙️ Для админа:")
     print("• /givemoney ID сумма - выдать баланс")
+    print("• /delbalance ID сумма - снять баланс")
     print("• /game mines номер - просмотр информации об игре")
     print("=" * 50)
     
