@@ -2,10 +2,14 @@ import logging
 import random
 import re
 import asyncio
+import sqlite3
+import os
 from typing import Dict, List, Tuple, Set, Any
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, Dice
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes, MessageHandler, filters
-from datetime import datetime
+from datetime import datetime, timedelta
+import threading
+import time
 
 # Настройка логирования
 logging.basicConfig(
@@ -21,25 +25,16 @@ TOKEN = "7979153629:AAFDc8hILEVuQ7lyDrVBIOX1ddLqzp3WcLw"
 ADMIN_ID = 7313407194
 ADMIN_USERNAME = "@pensiya_get"
 
-# Минимальные суммы
+# Минимальные суммы (ОБНОВЛЕНО)
 MIN_DEPOSIT = 25  # Минимальное пополнение
-MIN_WITHDRAWAL = 300 # Минимальный вывод
+MIN_WITHDRAWAL = 750  # Минимальный вывод
 MIN_TRANSFER_AMOUNT = 10  # Минимальный перевод между пользователями
 
 # Глобальные счетчики
 game_counter = 0
 games_history: Dict[int, Dict] = {}
 
-# Хранилище данных
-user_data: Dict[int, Dict] = {
-    ADMIN_ID: {  # Предварительно добавляем администратора
-        "balance": 0,
-        "username": ADMIN_USERNAME,
-        "first_name": "Администратор",
-        "deposits": [],
-        "withdrawals": []
-    }
-}
+# Хранилище данных для игрового процесса
 game_data: Dict[int, Dict] = {}
 user_bets: Dict[int, int] = {}
 
@@ -47,7 +42,7 @@ user_bets: Dict[int, int] = {}
 withdrawal_requests: Dict[int, Dict] = {}
 
 # Константы игры
-INITIAL_BALANCE = 25
+INITIAL_BALANCE = 0  # НАЧАЛЬНЫЙ БАЛАНС 0₽
 MIN_BET = 25
 GRID_SIZE = 5
 TOTAL_CELLS = GRID_SIZE * GRID_SIZE
@@ -56,7 +51,7 @@ MAX_MINES = 2
 
 # Множители
 MULTIPLIERS = {
-    2: 1.07
+    2: 1.12
 }
 
 # Множители для игры в кубы
@@ -69,23 +64,601 @@ DICE_MULTIPLIERS = {
 # Комиссия за перевод (в процентах)
 TRANSFER_FEE_PERCENT = 0  # 0% комиссия
 
+# Таймер для ежедневных наград топ-игрокам
+DAILY_TOP_REWARD = 100  # 100₽ для каждого из топ-3
+LAST_DAILY_REWARD_DATE = None
+
+# ========== БАЗА ДАННЫХ SQLite ==========
+class Database:
+    def __init__(self, db_name="casino.db"):
+        self.db_name = db_name
+        self.init_database()
+    
+    def init_database(self):
+        """Инициализация базы данных"""
+        conn = sqlite3.connect(self.db_name)
+        cursor = conn.cursor()
+        
+        # Таблица пользователей
+        cursor.execute('''
+        CREATE TABLE IF NOT EXISTS users (
+            user_id INTEGER PRIMARY KEY,
+            username TEXT,
+            first_name TEXT,
+            balance INTEGER DEFAULT 0,
+            total_won INTEGER DEFAULT 0,
+            total_games INTEGER DEFAULT 0,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+        ''')
+        
+        # Таблица транзакций (пополнения/выводы)
+        cursor.execute('''
+        CREATE TABLE IF NOT EXISTS transactions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER,
+            amount INTEGER,
+            type TEXT,  -- 'deposit', 'withdrawal', 'win', 'loss', 'transfer_in', 'transfer_out', 'daily_reward'
+            description TEXT,
+            admin_id INTEGER,
+            status TEXT DEFAULT 'completed',
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (user_id) REFERENCES users (user_id)
+        )
+        ''')
+        
+        # Таблица игр
+        cursor.execute('''
+        CREATE TABLE IF NOT EXISTS games (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER,
+            game_type TEXT,  -- 'mines', 'dice'
+            bet_amount INTEGER,
+            result TEXT,  -- 'win', 'loss', 'cashout'
+            win_amount INTEGER DEFAULT 0,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (user_id) REFERENCES users (user_id)
+        )
+        ''')
+        
+        # Таблица переводов между пользователями
+        cursor.execute('''
+        CREATE TABLE IF NOT EXISTS transfers (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            from_user_id INTEGER,
+            to_user_id INTEGER,
+            amount INTEGER,
+            fee INTEGER DEFAULT 0,
+            net_amount INTEGER,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (from_user_id) REFERENCES users (user_id),
+            FOREIGN KEY (to_user_id) REFERENCES users (user_id)
+        )
+        ''')
+        
+        # Таблица ежедневных наград
+        cursor.execute('''
+        CREATE TABLE IF NOT EXISTS daily_rewards (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER,
+            reward_amount INTEGER,
+            rank INTEGER,
+            reward_date DATE,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (user_id) REFERENCES users (user_id)
+        )
+        ''')
+        
+        conn.commit()
+        conn.close()
+    
+    def get_connection(self):
+        """Получить соединение с базой данных"""
+        return sqlite3.connect(self.db_name)
+    
+    def get_user(self, user_id: int):
+        """Получить пользователя из базы данных"""
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        cursor.execute('SELECT * FROM users WHERE user_id = ?', (user_id,))
+        user = cursor.fetchone()
+        conn.close()
+        
+        if user:
+            return {
+                'user_id': user[0],
+                'username': user[1],
+                'first_name': user[2],
+                'balance': user[3],
+                'total_won': user[4],
+                'total_games': user[5],
+                'created_at': user[6],
+                'updated_at': user[7]
+            }
+        return None
+    
+    def create_user(self, user_id: int, username: str, first_name: str):
+        """Создать нового пользователя"""
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        
+        # Проверяем, существует ли пользователь
+        cursor.execute('SELECT * FROM users WHERE user_id = ?', (user_id,))
+        if not cursor.fetchone():
+            cursor.execute('''
+            INSERT INTO users (user_id, username, first_name, balance)
+            VALUES (?, ?, ?, ?)
+            ''', (user_id, username, first_name, INITIAL_BALANCE))
+            conn.commit()
+        
+        conn.close()
+    
+    def update_user_balance(self, user_id: int, amount: int, transaction_type: str, 
+                          description: str = "", admin_id: int = None):
+        """Обновить баланс пользователя и создать запись о транзакции"""
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        
+        # Получаем текущий баланс
+        cursor.execute('SELECT balance FROM users WHERE user_id = ?', (user_id,))
+        result = cursor.fetchone()
+        
+        if not result:
+            conn.close()
+            return False
+        
+        current_balance = result[0]
+        new_balance = current_balance + amount
+        
+        # Обновляем баланс
+        cursor.execute('''
+        UPDATE users 
+        SET balance = ?, updated_at = CURRENT_TIMESTAMP 
+        WHERE user_id = ?
+        ''', (new_balance, user_id))
+        
+        # Обновляем статистику если это выигрыш
+        if transaction_type == 'win':
+            cursor.execute('''
+            UPDATE users 
+            SET total_won = total_won + ?, total_games = total_games + 1 
+            WHERE user_id = ?
+            ''', (amount, user_id))
+        elif transaction_type == 'loss':
+            cursor.execute('''
+            UPDATE users 
+            SET total_games = total_games + 1 
+            WHERE user_id = ?
+            ''', (user_id,))
+        
+        # Создаем запись о транзакции
+        cursor.execute('''
+        INSERT INTO transactions (user_id, amount, type, description, admin_id)
+        VALUES (?, ?, ?, ?, ?)
+        ''', (user_id, amount, transaction_type, description, admin_id))
+        
+        conn.commit()
+        conn.close()
+        return True
+    
+    def get_user_balance(self, user_id: int):
+        """Получить баланс пользователя"""
+        user = self.get_user(user_id)
+        if user:
+            return user['balance']
+        return INITIAL_BALANCE
+    
+    def get_transaction_history(self, user_id: int, limit: int = 10):
+        """Получить историю транзакций пользователя"""
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        
+        cursor.execute('''
+        SELECT amount, type, description, created_at 
+        FROM transactions 
+        WHERE user_id = ? 
+        ORDER BY created_at DESC 
+        LIMIT ?
+        ''', (user_id, limit))
+        
+        transactions = cursor.fetchall()
+        conn.close()
+        
+        return [
+            {
+                'amount': t[0],
+                'type': t[1],
+                'description': t[2],
+                'date': t[3]
+            }
+            for t in transactions
+        ]
+    
+    def get_total_deposits(self, user_id: int):
+        """Получить общую сумму пополнений пользователя"""
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        
+        cursor.execute('''
+        SELECT COALESCE(SUM(amount), 0) 
+        FROM transactions 
+        WHERE user_id = ? AND type = 'deposit' AND status = 'completed'
+        ''', (user_id,))
+        
+        total = cursor.fetchone()[0]
+        conn.close()
+        return total
+    
+    def get_total_withdrawals(self, user_id: int):
+        """Получить общую сумму выводов пользователя"""
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        
+        cursor.execute('''
+        SELECT COALESCE(SUM(amount), 0) 
+        FROM transactions 
+        WHERE user_id = ? AND type = 'withdrawal' AND status = 'completed'
+        ''', (user_id,))
+        
+        total = cursor.fetchone()[0]
+        conn.close()
+        return total
+    
+    def record_game(self, user_id: int, game_type: str, bet_amount: int, 
+                   result: str, win_amount: int = 0):
+        """Записать результат игры"""
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        
+        cursor.execute('''
+        INSERT INTO games (user_id, game_type, bet_amount, result, win_amount)
+        VALUES (?, ?, ?, ?, ?)
+        ''', (user_id, game_type, bet_amount, result, win_amount))
+        
+        conn.commit()
+        conn.close()
+    
+    def record_transfer(self, from_user_id: int, to_user_id: int, 
+                       amount: int, fee: int, net_amount: int):
+        """Записать перевод между пользователями"""
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        
+        cursor.execute('''
+        INSERT INTO transfers (from_user_id, to_user_id, amount, fee, net_amount)
+        VALUES (?, ?, ?, ?, ?)
+        ''', (from_user_id, to_user_id, amount, fee, net_amount))
+        
+        conn.commit()
+        conn.close()
+    
+    def get_top_users_by_balance(self, limit: int = 10):
+        """Получить топ пользователей по балансу"""
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        
+        cursor.execute('''
+        SELECT user_id, username, first_name, balance, total_won, total_games 
+        FROM users 
+        WHERE balance > 0 
+        ORDER BY balance DESC 
+        LIMIT ?
+        ''', (limit,))
+        
+        users = cursor.fetchall()
+        conn.close()
+        
+        return [
+            {
+                'user_id': u[0],
+                'username': u[1],
+                'first_name': u[2],
+                'balance': u[3],
+                'total_won': u[4],
+                'total_games': u[5]
+            }
+            for u in users
+        ]
+    
+    def get_top_users_by_wins(self, limit: int = 10):
+        """Получить топ пользователей по выигрышам"""
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        
+        cursor.execute('''
+        SELECT user_id, username, first_name, balance, total_won, total_games 
+        FROM users 
+        WHERE total_won > 0 
+        ORDER BY total_won DESC 
+        LIMIT ?
+        ''', (limit,))
+        
+        users = cursor.fetchall()
+        conn.close()
+        
+        return [
+            {
+                'user_id': u[0],
+                'username': u[1],
+                'first_name': u[2],
+                'balance': u[3],
+                'total_won': u[4],
+                'total_games': u[5]
+            }
+            for u in users
+        ]
+    
+    def check_daily_reward_given(self, date_str: str):
+        """Проверить, выдавались ли награды за указанную дату"""
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        
+        cursor.execute('''
+        SELECT COUNT(*) FROM daily_rewards WHERE reward_date = ?
+        ''', (date_str,))
+        
+        count = cursor.fetchone()[0]
+        conn.close()
+        return count > 0
+    
+    def give_daily_top_rewards(self, date_str: str):
+        """Выдать ежедневные награды топ-3 игрокам"""
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        
+        # Получаем топ-3 по балансу
+        cursor.execute('''
+        SELECT user_id, username, balance 
+        FROM users 
+        WHERE balance > 0 
+        ORDER BY balance DESC 
+        LIMIT 3
+        ''', )
+        
+        top_users = cursor.fetchall()
+        
+        if not top_users:
+            conn.close()
+            return []
+        
+        rewarded_users = []
+        rank = 1
+        
+        for user in top_users:
+            user_id = user[0]
+            username = user[1]
+            balance = user[2]
+            
+            # Добавляем награду
+            cursor.execute('''
+            INSERT INTO daily_rewards (user_id, reward_amount, rank, reward_date)
+            VALUES (?, ?, ?, ?)
+            ''', (user_id, DAILY_TOP_REWARD, rank, date_str))
+            
+            # Обновляем баланс
+            cursor.execute('''
+            UPDATE users SET balance = balance + ? WHERE user_id = ?
+            ''', (DAILY_TOP_REWARD, user_id))
+            
+            # Записываем транзакцию
+            cursor.execute('''
+            INSERT INTO transactions (user_id, amount, type, description)
+            VALUES (?, ?, ?, ?)
+            ''', (user_id, DAILY_TOP_REWARD, 'daily_reward', f'Ежедневная награда за {rank} место в топе'))
+            
+            rewarded_users.append({
+                'user_id': user_id,
+                'username': username,
+                'rank': rank,
+                'reward': DAILY_TOP_REWARD,
+                'new_balance': balance + DAILY_TOP_REWARD
+            })
+            
+            rank += 1
+        
+        conn.commit()
+        conn.close()
+        return rewarded_users
+
+# Инициализируем базу данных
+db = Database()
+
+# ========== ФУНКЦИИ РАБОТЫ С БАЗОЙ ДАННЫХ ==========
+def get_or_create_user(user_id: int, username: str = "", first_name: str = ""):
+    """Получить или создать пользователя"""
+    user = db.get_user(user_id)
+    if not user:
+        db.create_user(user_id, username, first_name)
+        user = db.get_user(user_id)
+    return user
+
+def get_balance(user_id: int):
+    """Получить баланс пользователя"""
+    return db.get_user_balance(user_id)
+
+def update_balance(user_id: int, amount: int, transaction_type: str, 
+                  description: str = "", admin_id: int = None):
+    """Обновить баланс пользователя"""
+    return db.update_user_balance(user_id, amount, transaction_type, description, admin_id)
+
+def get_transaction_stats(user_id: int):
+    """Получить статистику транзакций пользователя"""
+    total_deposits = db.get_total_deposits(user_id)
+    total_withdrawals = db.get_total_withdrawals(user_id)
+    return total_deposits, total_withdrawals
+
+# ========== КОМАНДА /RESERVE - КАЗНА БОТА ==========
+async def reserve_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Показывает казну бота (случайную сумму)"""
+    user_id = update.effective_user.id
+    
+    # Генерируем случайную сумму для казны
+    reserve_amount = random.randint(100000, 500000)  # от 100к до 500к
+    
+    # Создаем красивый вывод
+    reserve_text = f"""
+<b>💰 Казна бота</b>
+
+💎 <b>Баланс казны:</b> {reserve_amount:,}₽
+
+📊 <b>Информация:</b>
+Казна бота пополняется за счет комиссий с игр и пополнений.
+Средства из казны используются для выплат выигрышей и бонусов.
+
+💡 <b>Для пополнения/вывода:</b>
+Обращайтесь к администратору {ADMIN_USERNAME}
+    """
+    
+    keyboard = [
+        [InlineKeyboardButton(f"Связаться с {ADMIN_USERNAME}", url=f"https://t.me/{ADMIN_USERNAME[1:]}")],
+        [InlineKeyboardButton("Обновить", callback_data="refresh_reserve")]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    await update.message.reply_text(
+        reserve_text,
+        parse_mode='HTML',
+        reply_markup=reply_markup
+    )
+
+# ========== КОМАНДА /TOP - ТОП ИГРОКОВ ==========
+async def top_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Показывает топ игроков по балансу"""
+    user_id = update.effective_user.id
+    
+    # Получаем топ-10 по балансу
+    top_by_balance = db.get_top_users_by_balance(10)
+    
+    # Получаем топ-5 по выигрышам
+    top_by_wins = db.get_top_users_by_wins(5)
+    
+    # Формируем текст топа по балансу
+    top_balance_text = ""
+    if top_by_balance:
+        for i, user in enumerate(top_by_balance, 1):
+            username = user['username'] or user['first_name'] or f"ID: {user['user_id']}"
+            emoji = "👑" if i == 1 else "🥈" if i == 2 else "🥉" if i == 3 else f"{i}."
+            top_balance_text += f"{emoji} {username}: <b>{user['balance']:,}₽</b>\n"
+    else:
+        top_balance_text = "Пока никто не пополнил баланс 😔\n"
+    
+    # Формируем текст топа по выигрышам
+    top_wins_text = ""
+    if top_by_wins:
+        for i, user in enumerate(top_by_wins[:5], 1):
+            username = user['username'] or user['first_name'] or f"ID: {user['user_id']}"
+            emoji = "🏆" if i == 1 else "🎖️" if i == 2 else "⭐" if i == 3 else f"{i}."
+            games_count = user['total_games']
+            win_rate = (user['total_won'] / (user['total_won'] + games_count * 100)) * 100 if games_count > 0 else 0
+            top_wins_text += f"{emoji} {username}: <b>{user['total_won']:,}₽</b> ({games_count} игр)\n"
+    else:
+        top_wins_text = "Пока никто не выигрывал 😔\n"
+    
+    # Проверяем, выдавались ли сегодня награды
+    today_str = datetime.now().strftime("%Y-%m-%d")
+    rewards_given_today = db.check_daily_reward_given(today_str)
+    
+    reward_info = "✅ Сегодня награды уже выданы" if rewards_given_today else "⏳ Награды будут выданы сегодня"
+    
+    top_text = f"""
+<b>🏆 Топ игроков Spindja Casino</b>
+
+💰 <b>Топ по балансу:</b>
+{top_balance_text}
+
+🎯 <b>Топ по выигрышам:</b>
+{top_wins_text}
+
+🎁 <b>Ежедневные награды:</b>
+Каждый день топ-3 игрока по балансу получают по <b>100₽</b>
+{reward_info}
+
+📅 Следующая раздача наград: <b>завтра в 00:00</b>
+
+💡 <b>Как попасть в топ?</b>
+• Пополняйте баланс
+• Играйте и выигрывайте
+• Переводите средства друзьям
+    """
+    
+    keyboard = [
+        [InlineKeyboardButton("Мой баланс", callback_data="balance")],
+        [InlineKeyboardButton("Пополнить баланс", callback_data="deposit")],
+        [InlineKeyboardButton("Казна бота", callback_data="show_reserve")]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    await update.message.reply_text(
+        top_text,
+        parse_mode='HTML',
+        reply_markup=reply_markup
+    )
+
+# ========== ЕЖЕДНЕВНЫЕ НАГРАДЫ ТОП-ИГРОКАМ ==========
+async def check_and_give_daily_rewards(context: ContextTypes.DEFAULT_TYPE):
+    """Проверяет и выдает ежедневные награды топ-игрокам"""
+    try:
+        today_str = datetime.now().strftime("%Y-%m-%d")
+        
+        # Проверяем, выдавались ли уже награды сегодня
+        if not db.check_daily_reward_given(today_str):
+            # Выдаем награды
+            rewarded_users = db.give_daily_top_rewards(today_str)
+            
+            if rewarded_users:
+                # Уведомляем администратора
+                admin_message = "🎉 <b>Ежедневные награды выданы!</b>\n\n"
+                for user in rewarded_users:
+                    admin_message += f"{user['rank']}. @{user['username'] or 'Аноним'}: +{user['reward']}₽ (Баланс: {user['new_balance']}₽)\n"
+                
+                try:
+                    await context.bot.send_message(
+                        chat_id=ADMIN_ID,
+                        text=admin_message,
+                        parse_mode='HTML'
+                    )
+                except:
+                    pass
+                
+                # Уведомляем пользователей
+                for user in rewarded_users:
+                    try:
+                        await context.bot.send_message(
+                            chat_id=user['user_id'],
+                            text=f"🎁 <b>Поздравляем!</b>\n\n"
+                                 f"Вы заняли {user['rank']}-е место в ежедневном топе и получаете награду <b>{user['reward']}₽</b>!\n"
+                                 f"Ваш новый баланс: <b>{user['new_balance']}₽</b>\n\n"
+                                 f"Спасибо за игру в Spindja Casino! 🎰",
+                            parse_mode='HTML'
+                        )
+                    except:
+                        pass
+                
+                logger.info(f"Ежедневные награды выданы для {len(rewarded_users)} пользователей")
+            else:
+                logger.info("Нет пользователей для выдачи ежедневных наград")
+    except Exception as e:
+        logger.error(f"Ошибка при выдаче ежедневных наград: {e}")
+
+# ========== ОБРАБОТЧИКИ КОМАНД ==========
 # Обработчик команды /start
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Отправляет приветственное сообщение с кнопками"""
     user_id = update.effective_user.id
+    username = update.effective_user.username or update.effective_user.first_name
+    first_name = update.effective_user.first_name
     
-    if user_id not in user_data:
-        user_data[user_id] = {
-            "balance": INITIAL_BALANCE, 
-            "username": update.effective_user.username or update.effective_user.first_name,
-            "first_name": update.effective_user.first_name,
-            "deposits": [],
-            "withdrawals": []
-        }
+    # Получаем или создаем пользователя в БД
+    get_or_create_user(user_id, username, first_name)
+    
+    balance = get_balance(user_id)
     
     keyboard = [
         [InlineKeyboardButton("Играть", callback_data="play_menu")],
         [InlineKeyboardButton("Баланс", callback_data="balance")],
+        [InlineKeyboardButton("Топ игроков", callback_data="show_top")],
+        [InlineKeyboardButton("Казна бота", callback_data="show_reserve")],
         [InlineKeyboardButton("Вывести средства", callback_data="withdraw_menu")],
         [InlineKeyboardButton("Пополнить баланс", callback_data="deposit")]
     ]
@@ -96,10 +669,14 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 Мы рады видеть вас в нашем казино!
 
-🎮 <b>Ваш баланс:</b> {user_data[user_id]['balance']}₽
+🎮 <b>Ваш баланс:</b> {balance}₽
+
+🎁 <b>Новое:</b> Ежедневные награды топ-3 игрокам по 100₽!
 
 <u>Доступные команды:</u>
 • <code>/balance</code> / <code>/bal</code> / <code>/b</code> - показать баланс
+• <code>/top</code> - топ игроков по балансу
+• <code>/reserve</code> - казна бота
 • <code>/pay сумма</code> - перевести другу (ответом на сообщение)
 • <code>/pay ID сумма</code> - перевести по ID пользователя
 • Напишите <code>мины</code> - игра в мины
@@ -121,25 +698,20 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 async def balance_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Показывает баланс пользователя"""
     user_id = update.effective_user.id
+    username = update.effective_user.username or update.effective_user.first_name
+    first_name = update.effective_user.first_name
     
-    if user_id not in user_data:
-        user_data[user_id] = {
-            "balance": INITIAL_BALANCE, 
-            "username": update.effective_user.username or update.effective_user.first_name,
-            "first_name": update.effective_user.first_name,
-            "deposits": [],
-            "withdrawals": []
-        }
+    # Получаем или создаем пользователя в БД
+    get_or_create_user(user_id, username, first_name)
     
     await show_balance_message(update.message, user_id)
 
 async def show_balance_message(message, user_id: int):
     """Показывает баланс пользователя"""
-    balance = user_data[user_id]["balance"]
+    balance = get_balance(user_id)
     
     # Рассчитываем общие суммы
-    total_deposits = sum(dep["amount"] for dep in user_data[user_id].get("deposits", []))
-    total_withdrawals = sum(wd["amount"] for wd in user_data[user_id].get("withdrawals", []))
+    total_deposits, total_withdrawals = get_transaction_stats(user_id)
     
     saved_bet = user_bets.get(user_id, None)
     bet_info = f"\n💾 Сохраненная ставка: {saved_bet}₽" if saved_bet else ""
@@ -165,11 +737,15 @@ async def show_balance_message(message, user_id: int):
 
 💸 <u>Переводы:</u>
 Используйте <code>/pay сумма</code> для переводов друзьям!
+
+🎁 <u>Ежедневные награды:</u>
+Топ-3 игрока по балансу каждый день получают по 100₽!
     """
     
     keyboard = [
         [InlineKeyboardButton("Пополнить баланс", callback_data="deposit")],
         [InlineKeyboardButton("Вывести средства", callback_data="withdraw_menu")],
+        [InlineKeyboardButton("Топ игроков", callback_data="show_top")],
         [InlineKeyboardButton("Меню игр", callback_data="play_menu")],
         [InlineKeyboardButton("Назад", callback_data="back_to_main")]
     ]
@@ -181,20 +757,100 @@ async def show_balance_message(message, user_id: int):
         reply_markup=reply_markup
     )
 
+# Меню пополнения баланса
+async def deposit_menu(query, user_id):
+    """Меню пополнения баланса"""
+    balance = get_balance(user_id)
+    
+    keyboard = [
+        [InlineKeyboardButton(f"Связаться с {ADMIN_USERNAME}", url=f"https://t.me/{ADMIN_USERNAME[1:]}")],
+        [InlineKeyboardButton("Назад", callback_data="balance")]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    deposit_text = f"""
+<b>💰 Пополнение баланса</b>
+
+💳 Ваш текущий баланс: <b>{balance}₽</b>
+
+<u>Требования к пополнению:</u>
+• Минимальная сумма: <b>{MIN_DEPOSIT}₽</b>
+• Пополнение через администратора: {ADMIN_USERNAME}
+
+💎 <b>Доступные способы пополнения:</b>
+1. <b>Криптовалюта</b> (USDT, BTC, ETH) - через CryptoBot
+2. <b>Банковские карты</b> РФ
+3. <b>QIWI</b> / <b>ЮMoney</b>
+
+📞 <b>Инструкция по пополнению:</b>
+1. Нажмите кнопку ниже для связи с администратором
+2. Укажите ваш ID: <code>{user_id}</code>
+3. Укажите желаемую сумму пополнения (от {MIN_DEPOSIT}₽)
+4. Выберите способ оплаты
+5. Дождитесь подтверждения от администратора
+
+⏱️ Пополнение происходит в течение 5-15 минут после подтверждения.
+    """
+    
+    await query.edit_message_text(
+        text=deposit_text,
+        parse_mode='HTML',
+        reply_markup=reply_markup
+    )
+
+# Меню вывода средств
+async def withdraw_menu(query, user_id):
+    """Меню вывода средств"""
+    balance = get_balance(user_id)
+    
+    keyboard = [
+        [InlineKeyboardButton(f"Связаться с {ADMIN_USERNAME}", url=f"https://t.me/{ADMIN_USERNAME[1:]}")],
+        [InlineKeyboardButton("Назад", callback_data="balance")]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    withdraw_text = f"""
+<b>💸 Вывод средств</b>
+
+💳 Ваш текущий баланс: <b>{balance}₽</b>
+
+<u>Требования к выводу:</u>
+• Минимальная сумма вывода: <b>{MIN_WITHDRAWAL}₽</b>
+• Вывод через администратора: {ADMIN_USERNAME}
+
+💎 <b>Доступные способы вывода:</b>
+1. <b>Криптовалюта</b> (USDT через CryptoBot) - приоритетный способ
+2. <b>Банковские карты</b> РФ
+3. <b>QIWI</b> / <b>ЮMoney</b>
+
+📋 <b>Инструкция по выводу:</b>
+1. Нажмите кнопку ниже для связи с администратором
+2. Укажите ваш ID: <code>{user_id}</code>
+3. Укажите сумму вывода (от {MIN_WITHDRAWAL}₽)
+4. Выберите способ получения средств
+5. Укажите реквизиты (адрес кошелька/номер карты)
+6. Дождитесь подтверждения и получения средств
+
+⏱️ Вывод происходит в течение 5-30 минут после подтверждения.
+
+⚠️ <b>Внимание:</b> При выводе на криптокошельки через CryptoBot возможны дополнительные комиссии сети.
+    """
+    
+    await query.edit_message_text(
+        text=withdraw_text,
+        parse_mode='HTML',
+        reply_markup=reply_markup
+    )
+
 # Команда для переводов /pay
 async def pay_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Перевод средств другому пользователю"""
     user_id = update.effective_user.id
     username = update.effective_user.username or update.effective_user.first_name
+    first_name = update.effective_user.first_name
     
-    if user_id not in user_data:
-        user_data[user_id] = {
-            "balance": INITIAL_BALANCE, 
-            "username": username,
-            "first_name": update.effective_user.first_name,
-            "deposits": [],
-            "withdrawals": []
-        }
+    # Получаем или создаем отправителя в БД
+    get_or_create_user(user_id, username, first_name)
     
     # Проверяем, является ли сообщение ответом на другое сообщение
     reply_to_message = update.message.reply_to_message
@@ -225,6 +881,7 @@ async def pay_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         # Получаем информацию о получателе
         target_id = target_user.id
         target_username = target_user.username or target_user.first_name
+        target_first_name = target_user.first_name
         
     else:
         # Перевод по ID
@@ -253,6 +910,7 @@ async def pay_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             # Это числовой ID
             target_id = int(target_arg)
             target_username = f"пользователь {target_id}"
+            target_first_name = f"Пользователь {target_id}"
         else:
             await update.message.reply_text("❌ Неверный формат получателя. Используйте числовой ID.")
             return
@@ -261,16 +919,8 @@ async def pay_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             await update.message.reply_text("❌ Нельзя переводить деньги самому себе!")
             return
         
-        # Проверяем существование пользователя
-        if target_id not in user_data:
-            # Создаем запись о пользователе, если он не существует
-            user_data[target_id] = {
-                "balance": INITIAL_BALANCE, 
-                "username": f"пользователь {target_id}",
-                "first_name": f"Пользователь {target_id}",
-                "deposits": [],
-                "withdrawals": []
-            }
+        # Создаем получателя в БД, если он не существует
+        get_or_create_user(target_id, target_username, target_first_name)
     
     # Проверяем сумму перевода
     if amount < MIN_TRANSFER_AMOUNT:
@@ -278,10 +928,11 @@ async def pay_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         return
     
     # Проверяем баланс отправителя
-    if user_data[user_id]["balance"] < amount:
+    sender_balance = get_balance(user_id)
+    if sender_balance < amount:
         await update.message.reply_text(
             f"❌ Недостаточно средств для перевода.\n"
-            f"Ваш баланс: {user_data[user_id]['balance']}₽\n"
+            f"Ваш баланс: {sender_balance}₽\n"
             f"Сумма перевода: {amount}₽",
             parse_mode='HTML'
         )
@@ -291,9 +942,27 @@ async def pay_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     fee = int(amount * TRANSFER_FEE_PERCENT / 100)
     net_amount = amount - fee
     
-    # Выполняем перевод
-    user_data[user_id]["balance"] -= amount
-    user_data[target_id]["balance"] += net_amount
+    # Выполняем перевод в базе данных
+    # Списание у отправителя
+    update_balance(
+        user_id, 
+        -amount, 
+        'transfer_out', 
+        f"Перевод пользователю {target_id} ({target_username})",
+        None
+    )
+    
+    # Зачисление получателю
+    update_balance(
+        target_id, 
+        net_amount, 
+        'transfer_in', 
+        f"Перевод от пользователя {user_id} ({username})",
+        None
+    )
+    
+    # Записываем перевод в отдельную таблицу
+    db.record_transfer(user_id, target_id, amount, fee, net_amount)
     
     # Сообщение об успешном переводе
     transfer_text = f"""
@@ -303,12 +972,12 @@ async def pay_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 👤 {username} (ID: {user_id})
 💰 Списано: {amount}₽
 💸 Комиссия: {fee}₽ ({TRANSFER_FEE_PERCENT}%)
-📊 Новый баланс: {user_data[user_id]['balance']}₽
+📊 Новый баланс: {get_balance(user_id)}₽
 
 📥 <u>Получатель:</u>
 👤 {target_username} (ID: {target_id})
 💰 Получено: {net_amount}₽
-📊 Новый баланс: {user_data[target_id]['balance']}₽
+📊 Новый баланс: {get_balance(target_id)}₽
 
 🕒 Перевод мгновенный
     """
@@ -326,7 +995,7 @@ async def pay_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                  f"📤 От: {username} (ID: {user_id})\n"
                  f"💰 Сумма: {net_amount}₽\n"
                  f"💸 Комиссия: {fee}₽\n"
-                 f"📊 Ваш новый баланс: {user_data[target_id]['balance']}₽\n\n"
+                 f"📊 Ваш новый баланс: {get_balance(target_id)}₽\n\n"
                  f"💝 Спасибо за использование нашего казино!",
             parse_mode='HTML'
         )
@@ -388,14 +1057,11 @@ async def dice_low_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 async def process_dice_quick_bet(update: Update, context: ContextTypes.DEFAULT_TYPE, user_id: int, 
                                  bet_type: str, number: int = None, amount: int = None) -> None:
     """Обрабатывает быстрые ставки в кубы"""
-    if user_id not in user_data:
-        user_data[user_id] = {
-            "balance": INITIAL_BALANCE, 
-            "username": update.effective_user.username or update.effective_user.first_name,
-            "first_name": update.effective_user.first_name,
-            "deposits": [],
-            "withdrawals": []
-        }
+    username = update.effective_user.username or update.effective_user.first_name
+    first_name = update.effective_user.first_name
+    
+    # Получаем или создаем пользователя в БД
+    get_or_create_user(user_id, username, first_name)
     
     # Если amount не передан, берем из аргументов
     if amount is None:
@@ -416,10 +1082,11 @@ async def process_dice_quick_bet(update: Update, context: ContextTypes.DEFAULT_T
         await update.message.reply_text(f"❌ Минимальная ставка: {MIN_BET}₽")
         return
     
-    if user_data[user_id]["balance"] < amount:
+    balance = get_balance(user_id)
+    if balance < amount:
         await update.message.reply_text(
             f"❌ Недостаточно средств на балансе.\n"
-            f"Ваш баланс: {user_data[user_id]['balance']}₽",
+            f"Ваш баланс: {balance}₽",
             parse_mode='HTML'
         )
         return
@@ -459,7 +1126,8 @@ async def process_dice_quick_bet(update: Update, context: ContextTypes.DEFAULT_T
     # Обрабатываем результат
     if win:
         win_amount = int(amount * multiplier)
-        user_data[user_id]["balance"] += win_amount
+        update_balance(user_id, win_amount, 'win', f"Выигрыш в кубах: {bet_name}")
+        db.record_game(user_id, 'dice', amount, 'win', win_amount)
         
         result_text = f"""
 🎲 <b>Кубы - Быстрая ставка</b>
@@ -470,12 +1138,13 @@ async def process_dice_quick_bet(update: Update, context: ContextTypes.DEFAULT_T
 
 ✅ <b>ВЫИГРЫШ!</b>
 🏆 Выигрыш: <b>{win_amount}₽</b> (x{multiplier})
-💰 Новый баланс: <b>{user_data[user_id]['balance']}₽</b>
+💰 Новый баланс: <b>{get_balance(user_id)}₽</b>
 
 🎉 Поздравляем с выигрышем!
         """
     else:
-        user_data[user_id]["balance"] -= amount
+        update_balance(user_id, -amount, 'loss', f"Проигрыш в кубах: {bet_name}")
+        db.record_game(user_id, 'dice', amount, 'loss', 0)
         
         result_text = f"""
 🎲 <b>Кубы - Быстрая ставка</b>
@@ -486,7 +1155,7 @@ async def process_dice_quick_bet(update: Update, context: ContextTypes.DEFAULT_T
 
 ❌ <b>ПРОИГРЫШ</b>
 💸 Ставка не возвращается
-💰 Новый баланс: <b>{user_data[user_id]['balance']}₽</b>
+💰 Новый баланс: <b>{get_balance(user_id)}₽</b>
 
 😔 В следующий раз повезет!
         """
@@ -621,29 +1290,24 @@ async def givemoney(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             await update.message.reply_text("❌ Сумма должна быть положительной.")
             return
         
-        if target_id not in user_data:
-            user_data[target_id] = {
-                "balance": INITIAL_BALANCE, 
-                "username": f"пользователь {target_id}",
-                "first_name": f"Пользователь {target_id}",
-                "deposits": [],
-                "withdrawals": []
-            }
+        # Получаем или создаем пользователя
+        target_user = db.get_user(target_id)
+        if not target_user:
+            # Создаем пользователя
+            db.create_user(target_id, f"пользователь {target_id}", f"Пользователь {target_id}")
         
-        user_data[target_id]["balance"] += amount
-        
-        # Добавляем запись о пополнении
-        deposit_record = {
-            "amount": amount,
-            "date": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            "admin_id": user_id,
-            "type": "администратор"
-        }
-        user_data[target_id]["deposits"].append(deposit_record)
+        # Пополняем баланс через БД
+        update_balance(
+            target_id, 
+            amount, 
+            'deposit', 
+            f"Пополнение баланса администратором {user_id}",
+            user_id
+        )
         
         await update.message.reply_text(
             f"✅ Баланс пользователя <code>{target_id}</code> пополнен на <b>{amount}₽</b>.\n"
-            f"Новый баланс: <b>{user_data[target_id]['balance']}₽</b>",
+            f"Новый баланс: <b>{get_balance(target_id)}₽</b>",
             parse_mode='HTML'
         )
         
@@ -651,7 +1315,7 @@ async def givemoney(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             await context.bot.send_message(
                 chat_id=target_id,
                 text=f"🎉 Ваш баланс пополнен на <b>{amount}₽</b> администратором!\n"
-                     f"Новый баланс: <b>{user_data[target_id]['balance']}₽</b>",
+                     f"Новый баланс: <b>{get_balance(target_id)}₽</b>",
                 parse_mode='HTML'
             )
         except:
@@ -686,24 +1350,33 @@ async def delbalance(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
             await update.message.reply_text("❌ Сумма должна быть положительной.")
             return
         
-        if target_id not in user_data:
+        target_user = db.get_user(target_id)
+        if not target_user:
             await update.message.reply_text(f"❌ Пользователь с ID {target_id} не найден.")
             return
         
-        if user_data[target_id]["balance"] < amount:
+        target_balance = get_balance(target_id)
+        if target_balance < amount:
             await update.message.reply_text(
                 f"❌ У пользователя недостаточно средств.\n"
-                f"Баланс пользователя: {user_data[target_id]['balance']}₽\n"
+                f"Баланс пользователя: {target_balance}₽\n"
                 f"Сумма списания: {amount}₽",
                 parse_mode='HTML'
             )
             return
         
-        user_data[target_id]["balance"] -= amount
+        # Списание через БД
+        update_balance(
+            target_id, 
+            -amount, 
+            'withdrawal', 
+            f"Списание баланса администратором {user_id}",
+            user_id
+        )
         
         await update.message.reply_text(
             f"✅ С пользователя <code>{target_id}</code> списано <b>{amount}₽</b>.\n"
-            f"Новый баланс: <b>{user_data[target_id]['balance']}₽</b>",
+            f"Новый баланс: <b>{get_balance(target_id)}₽</b>",
             parse_mode='HTML'
         )
         
@@ -711,7 +1384,7 @@ async def delbalance(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
             await context.bot.send_message(
                 chat_id=target_id,
                 text=f"⚠️ С вашего баланса списано <b>{amount}₽</b> администратором!\n"
-                     f"Новый баланс: <b>{user_data[target_id]['balance']}₽</b>",
+                     f"Новый баланс: <b>{get_balance(target_id)}₽</b>",
                 parse_mode='HTML'
             )
         except:
@@ -747,16 +1420,13 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
 # Запуск игры "Кубы" из чата
 async def start_dice_from_chat(update: Update, user_id: int) -> None:
     """Запускает игру Кубы из текстового сообщения"""
-    if user_id not in user_data:
-        user_data[user_id] = {
-            "balance": INITIAL_BALANCE, 
-            "username": update.effective_user.username or update.effective_user.first_name,
-            "first_name": update.effective_user.first_name,
-            "deposits": [],
-            "withdrawals": []
-        }
+    username = update.effective_user.username or update.effective_user.first_name
+    first_name = update.effective_user.first_name
     
-    balance = user_data[user_id]["balance"]
+    # Получаем или создаем пользователя в БД
+    get_or_create_user(user_id, username, first_name)
+    
+    balance = get_balance(user_id)
     
     keyboard = [
         [
@@ -773,7 +1443,7 @@ async def start_dice_from_chat(update: Update, user_id: int) -> None:
     setup_text = f"""
 <b>🎮 Игра в Кубы</b>
 
-👤 {update.effective_user.username or update.effective_user.first_name}
+👤 {username}
 💰 Баланс: {balance}₽
 
 <u>Выберите тип ставки:</u>
@@ -803,83 +1473,10 @@ async def start_dice_from_chat(update: Update, user_id: int) -> None:
         reply_markup=reply_markup
     )
 
-# Меню пополнения баланса
-async def deposit_menu(query, user_id):
-    """Меню пополнения баланса"""
-    balance = user_data[user_id]["balance"]
-    
-    keyboard = [
-        [InlineKeyboardButton(f"Связаться с {ADMIN_USERNAME}", url=f"https://t.me/{ADMIN_USERNAME[1:]}")],
-        [InlineKeyboardButton("Назад", callback_data="balance")]
-    ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    
-    deposit_text = f"""
-<b>💰 Пополнение баланса</b>
-
-💳 Ваш текущий баланс: <b>{balance}₽</b>
-
-<u>Требования к пополнению:</u>
-• Минимальная сумма: <b>{MIN_DEPOSIT}₽</b>
-• Пополнение через администратора: {ADMIN_USERNAME}
-
-📞 <b>Инструкция по пополнению:</b>
-1. Нажмите кнопку ниже для связи с администратором
-2. Укажите ваш ID: <code>{user_id}</code>
-3. Укажите желаемую сумму пополнения
-4. Дождитесь подтверждения от администратора
-
-⏱️ Пополнение происходит в течение 5-15 минут после подтверждения.
-    """
-    
-    await query.edit_message_text(
-        text=deposit_text,
-        parse_mode='HTML',
-        reply_markup=reply_markup
-    )
-
-# Меню вывода средств
-async def withdraw_menu(query, user_id):
-    """Меню вывода средств"""
-    balance = user_data[user_id]["balance"]
-    
-    keyboard = [
-        [InlineKeyboardButton(f"Связаться с {ADMIN_USERNAME}", url=f"https://t.me/{ADMIN_USERNAME[1:]}")],
-        [InlineKeyboardButton("Назад", callback_data="balance")]
-    ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    
-    withdraw_text = f"""
-<b>💸 Вывод средств</b>
-
-💳 Ваш текущий баланс: <b>{balance}₽</b>
-
-<u>Требования к выводу:</u>
-• Минимальная сумма вывода: <b>{MIN_WITHDRAWAL}₽</b>
-• Вывод через администратора: {ADMIN_USERNAME}
-
-📋 <b>Инструкция по выводу:</b>
-1. Нажмите кнопку ниже для связи с администратором
-2. Укажите ваш ID: <code>{user_id}</code>
-3. Укажите сумму вывода (от {MIN_WITHDRAWAL}₽)
-4. Укажите реквизиты для перевода
-5. Дождитесь подтверждения и получения средств
-
-⏱️ Вывод происходит в течение 5-30 минут после подтверждения.
-
-⚠️ <b>Внимание:</b> Средства выводятся только на карты РФ или через другие доступные способы, согласованные с администратором.
-    """
-    
-    await query.edit_message_text(
-        text=withdraw_text,
-        parse_mode='HTML',
-        reply_markup=reply_markup
-    )
-
 # Меню игры в кубы
 async def dice_menu(query, user_id):
     """Меню игры в кубы"""
-    balance = user_data[user_id]["balance"]
+    balance = get_balance(user_id)
     
     keyboard = [
         [
@@ -888,8 +1485,7 @@ async def dice_menu(query, user_id):
         ],
         [
             InlineKeyboardButton("Больше/Меньше", callback_data="dice_high_low"),
-            InlineKeyboardButton("Назад", callback_data="play_menu")
-        ]
+            InlineKeyboardButton("Назад", callback_data="play_menu")]
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
     
@@ -923,7 +1519,7 @@ async def dice_menu(query, user_id):
 # Чет/Нечет в кубах
 async def dice_even_odd(query, user_id):
     """Ставка на чет/нечет в кубах"""
-    balance = user_data[user_id]["balance"]
+    balance = get_balance(user_id)
     
     keyboard = [
         [
@@ -960,7 +1556,7 @@ async def dice_even_odd(query, user_id):
 # Угадать число в кубах
 async def dice_number(query, user_id):
     """Ставка на число в кубах"""
-    balance = user_data[user_id]["balance"]
+    balance = get_balance(user_id)
     
     keyboard = [
         [
@@ -1004,7 +1600,7 @@ async def dice_number(query, user_id):
 # Больше/Меньше в кубах
 async def dice_high_low(query, user_id):
     """Ставка на больше/меньше в кубах"""
-    balance = user_data[user_id]["balance"]
+    balance = get_balance(user_id)
     
     keyboard = [
         [
@@ -1050,7 +1646,7 @@ async def process_dice_bet(query, user_id, bet_type: str, bet_value: str = None)
         "amount": saved_bet
     }
     
-    balance = user_data[user_id]["balance"]
+    balance = get_balance(user_id)
     
     # Определяем описание ставки
     bet_description = ""
@@ -1123,7 +1719,8 @@ async def dice_roll(query, user_id):
     bet_amount = game["amount"]
     
     # Проверяем баланс
-    if user_data[user_id]["balance"] < bet_amount:
+    balance = get_balance(user_id)
+    if balance < bet_amount:
         await query.answer("Недостаточно средств!")
         return
     
@@ -1170,7 +1767,8 @@ async def dice_roll(query, user_id):
     # Обрабатываем результат
     if win:
         win_amount = int(bet_amount * multiplier)
-        user_data[user_id]["balance"] += win_amount
+        update_balance(user_id, win_amount, 'win', f"Выигрыш в кубах: {bet_description}")
+        db.record_game(user_id, 'dice', bet_amount, 'win', win_amount)
         
         result_text = f"""
 🎲 <b>Кубы - Результат</b>
@@ -1181,12 +1779,13 @@ async def dice_roll(query, user_id):
 
 ✅ <b>ВЫИГРЫШ!</b>
 🏆 Выигрыш: <b>{win_amount}₽</b> (x{multiplier})
-💰 Новый баланс: <b>{user_data[user_id]['balance']}₽</b>
+💰 Новый баланс: <b>{get_balance(user_id)}₽</b>
 
 🎉 Поздравляем с выигрышем!
         """
     else:
-        user_data[user_id]["balance"] -= bet_amount
+        update_balance(user_id, -bet_amount, 'loss', f"Проигрыш в кубах: {bet_description}")
+        db.record_game(user_id, 'dice', bet_amount, 'loss', 0)
         
         result_text = f"""
 🎲 <b>Кубы - Результат</b>
@@ -1197,7 +1796,7 @@ async def dice_roll(query, user_id):
 
 ❌ <b>ПРОИГРЫШ</b>
 💸 Ставка не возвращается
-💰 Новый баланс: <b>{user_data[user_id]['balance']}₽</b>
+💰 Новый баланс: <b>{get_balance(user_id)}₽</b>
 
 😔 В следующий раз повезет!
         """
@@ -1219,7 +1818,7 @@ async def dice_roll(query, user_id):
 # Изменение ставки в кубах
 async def dice_change_bet(query, user_id):
     """Изменение ставки в кубах"""
-    balance = user_data[user_id]["balance"]
+    balance = get_balance(user_id)
     current_bet = game_data[user_id]["amount"] if user_id in game_data and "amount" in game_data[user_id] else MIN_BET
     
     saved_bet = user_bets.get(user_id, None)
@@ -1265,16 +1864,13 @@ async def dice_change_bet(query, user_id):
 # Запуск игры "Мины" из чата
 async def start_mines_from_chat(update: Update, user_id: int) -> None:
     """Запускает игру Мины из текстового сообщения"""
-    if user_id not in user_data:
-        user_data[user_id] = {
-            "balance": INITIAL_BALANCE, 
-            "username": update.effective_user.username or update.effective_user.first_name,
-            "first_name": update.effective_user.first_name,
-            "deposits": [],
-            "withdrawals": []
-        }
+    username = update.effective_user.username or update.effective_user.first_name
+    first_name = update.effective_user.first_name
     
-    balance = user_data[user_id]["balance"]
+    # Получаем или создаем пользователя в БД
+    get_or_create_user(user_id, username, first_name)
+    
+    balance = get_balance(user_id)
     
     if balance < MIN_BET:
         await update.message.reply_text(
@@ -1333,7 +1929,7 @@ async def start_mines_from_chat(update: Update, user_id: int) -> None:
     setup_text = f"""
 <b>🎮 Быстрый старт: Мины</b>
 
-👤 {update.effective_user.username or update.effective_user.first_name}
+👤 {username}
 💰 Баланс — {balance} ₽
 Ставка — {game_data[user_id]['bet']} ₽ {bet_source}(от {MIN_BET})
 
@@ -1385,14 +1981,11 @@ async def handle_bet_message(update: Update, user_id: int, match: re.Match) -> N
         )
         return
     
-    if user_id not in user_data:
-        user_data[user_id] = {
-            "balance": INITIAL_BALANCE, 
-            "username": update.effective_user.username or update.effective_user.first_name,
-            "first_name": update.effective_user.first_name,
-            "deposits": [],
-            "withdrawals": []
-        }
+    username = update.effective_user.username or update.effective_user.first_name
+    first_name = update.effective_user.first_name
+    
+    # Получаем или создаем пользователя в БД
+    get_or_create_user(user_id, username, first_name)
     
     user_bets[user_id] = amount
     
@@ -1409,16 +2002,13 @@ async def handle_bet_message(update: Update, user_id: int, match: re.Match) -> N
 # Показать баланс
 async def show_balance(query, user_id):
     """Показывает баланс пользователя"""
-    if user_id not in user_data:
-        user_data[user_id] = {
-            "balance": INITIAL_BALANCE, 
-            "username": query.from_user.username or query.from_user.first_name,
-            "first_name": query.from_user.first_name,
-            "deposits": [],
-            "withdrawals": []
-        }
+    username = query.from_user.username or query.from_user.first_name
+    first_name = query.from_user.first_name
     
-    balance = user_data[user_id]["balance"]
+    # Получаем или создаем пользователя в БД
+    get_or_create_user(user_id, username, first_name)
+    
+    balance = get_balance(user_id)
     keyboard = [
         [InlineKeyboardButton("Пополнить баланс", callback_data="deposit")],
         [InlineKeyboardButton("Вывести средства", callback_data="withdraw_menu")],
@@ -1430,8 +2020,7 @@ async def show_balance(query, user_id):
     bet_info = f"\n💾 Сохраненная ставка: {saved_bet}₽" if saved_bet else ""
     
     # Рассчитываем общие суммы
-    total_deposits = sum(dep["amount"] for dep in user_data[user_id].get("deposits", []))
-    total_withdrawals = sum(wd["amount"] for wd in user_data[user_id].get("withdrawals", []))
+    total_deposits, total_withdrawals = get_transaction_stats(user_id)
     
     balance_text = f"""
 <b>Ваш баланс</b>
@@ -1465,18 +2054,11 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     await query.answer()
     
     user_id = query.from_user.id
+    username = query.from_user.username or query.from_user.first_name
+    first_name = query.from_user.first_name
     
-    if user_id not in user_data:
-        user_data[user_id] = {
-            "balance": INITIAL_BALANCE, 
-            "username": query.from_user.username or query.from_user.first_name,
-            "first_name": query.from_user.first_name,
-            "deposits": [],
-            "withdrawals": []
-        }
-    
-    # Сохраняем имя пользователя
-    user_data[user_id]["username"] = query.from_user.username or query.from_user.first_name
+    # Получаем или создаем пользователя в БД
+    get_or_create_user(user_id, username, first_name)
     
     # Обработка основных команд
     if query.data == "play_menu":
@@ -1493,6 +2075,18 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     
     elif query.data == "withdraw_menu":
         await withdraw_menu(query, user_id)
+        return
+    
+    elif query.data == "show_top":
+        await show_top_menu(query, user_id)
+        return
+    
+    elif query.data == "show_reserve":
+        await show_reserve_menu(query, user_id)
+        return
+    
+    elif query.data == "refresh_reserve":
+        await refresh_reserve(query, user_id)
         return
     
     elif query.data == "chats":
@@ -1519,6 +2113,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         keyboard = [
             [InlineKeyboardButton("Играть", callback_data="play_menu")],
             [InlineKeyboardButton("Баланс", callback_data="balance")],
+            [InlineKeyboardButton("Топ игроков", callback_data="show_top")],
+            [InlineKeyboardButton("Казна бота", callback_data="show_reserve")],
             [InlineKeyboardButton("Вывести средства", callback_data="withdraw_menu")],
             [InlineKeyboardButton("Пополнить баланс", callback_data="deposit")]
         ]
@@ -1529,6 +2125,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
 <u>Быстрые команды:</u>
 • <code>/balance</code> / <code>/bal</code> / <code>/b</code> - показать баланс
+• <code>/top</code> - топ игроков по балансу
+• <code>/reserve</code> - казна бота
 • <code>/pay сумма</code> - перевести другу
 • Напишите <code>мины</code> - игра в мины (2 мины)
 • Напишите <code>кубы</code> - игра в кубы
@@ -1561,14 +2159,16 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     
     elif query.data.startswith("set_bet_"):
         bet = int(query.data.split("_")[2])
-        if bet <= user_data[user_id]["balance"]:
+        balance = get_balance(user_id)
+        if bet <= balance:
             game_data[user_id]["bet"] = bet
             user_bets[user_id] = bet
         await mines_setup(query, user_id)
         return
     
     elif query.data == "start_mines_game":
-        if user_data[user_id]["balance"] < game_data[user_id]["bet"]:
+        balance = get_balance(user_id)
+        if balance < game_data[user_id]["bet"]:
             await query.answer("Недостаточно средств на балансе!")
             return
         else:
@@ -1632,7 +2232,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     
     elif query.data.startswith("dice_set_bet_"):
         bet = int(query.data.split("_")[3])
-        if bet <= user_data[user_id]["balance"]:
+        balance = get_balance(user_id)
+        if bet <= balance:
             # Сохраняем ставку для кубов
             user_bets[user_id] = bet
             if user_id in game_data and "bet_type" in game_data[user_id]:
@@ -1655,14 +2256,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 # Главное меню игр
 async def play_menu(query, user_id):
     """Меню выбора игры"""
-    if user_id not in user_data:
-        user_data[user_id] = {
-            "balance": INITIAL_BALANCE, 
-            "username": query.from_user.username or query.from_user.first_name,
-            "first_name": query.from_user.first_name,
-            "deposits": [],
-            "withdrawals": []
-        }
+    balance = get_balance(user_id)
     
     keyboard = [
         [InlineKeyboardButton("Мины (2 мины)", callback_data="game_mines")],
@@ -1702,16 +2296,7 @@ async def mines_setup(query, user_id):
     """Настройка игры в мины"""
     global game_counter
     
-    if user_id not in user_data:
-        user_data[user_id] = {
-            "balance": INITIAL_BALANCE, 
-            "username": query.from_user.username or query.from_user.first_name,
-            "first_name": query.from_user.first_name,
-            "deposits": [],
-            "withdrawals": []
-        }
-    
-    balance = user_data[user_id]["balance"]
+    balance = get_balance(user_id)
     
     if user_id not in game_data:
         game_data[user_id] = {
@@ -1803,7 +2388,7 @@ def init_game_field(user_id):
     # Сохраняем информацию об игре для администратора
     games_history[game_counter] = {
         "user_id": user_id,
-        "username": user_data.get(user_id, {}).get("username", "Неизвестно"),
+        "username": query.from_user.username or query.from_user.first_name,
         "bet": game["bet"],
         "mines_count": 2,
         "mines": set(mines_positions),
@@ -1912,6 +2497,11 @@ async def handle_cell_click(query, user_id, cell_idx):
     if cell_idx in game["mines"]:
         game["game_active"] = False
         games_history[game["game_number"]]["status"] = "Проиграл"
+        
+        # Записываем проигрыш в БД
+        update_balance(user_id, -game["bet"], 'loss', f"Проигрыш в минах (игра #{game['game_number']})")
+        db.record_game(user_id, 'mines', game["bet"], 'loss', 0)
+        
         await end_game(query, user_id, win=False)
         return
     
@@ -1927,7 +2517,8 @@ async def end_game(query, user_id, win=True):
     
     if win:
         win_amount = game["won_amount"]
-        user_data[user_id]["balance"] += win_amount
+        update_balance(user_id, win_amount, 'win', f"Выигрыш в минах (игра #{game['game_number']})")
+        db.record_game(user_id, 'mines', game["bet"], 'win', win_amount)
         games_history[game["game_number"]]["status"] = "Выиграл"
         
         keyboard = [
@@ -1942,10 +2533,9 @@ async def end_game(query, user_id, win=True):
 🎉 Вы успешно собрали {win_amount}₽!
 
 Ваш выигрыш добавлен на баланс.
-Новый баланс: {user_data[user_id]['balance']}₽
+Новый баланс: {get_balance(user_id)}₽
         """
     else:
-        user_data[user_id]["balance"] -= game["bet"]
         games_history[game["game_number"]]["status"] = "Проиграл"
         
         keyboard = [
@@ -1960,7 +2550,7 @@ async def end_game(query, user_id, win=True):
 💥 Вы наткнулись на мину!
 
 Ставка {game['bet']}₽ не возвращается.
-Новый баланс: {user_data[user_id]['balance']}₽
+Новый баланс: {get_balance(user_id)}₽
         """
     
     reply_markup = InlineKeyboardMarkup(keyboard)
@@ -1982,7 +2572,8 @@ async def handle_cashout(query, user_id):
         return
     
     win_amount = game["won_amount"]
-    user_data[user_id]["balance"] += win_amount
+    update_balance(user_id, win_amount, 'win', f"Вывод выигрыша в минах (игра #{game['game_number']})")
+    db.record_game(user_id, 'mines', game["bet"], 'cashout', win_amount)
     game["game_active"] = False
     games_history[game["game_number"]]["status"] = "Забрал выигрыш"
     
@@ -1997,7 +2588,7 @@ async def handle_cashout(query, user_id):
 <u>Номер игры:</u> #{game['game_number']}
 
 💰 Вы забрали: {win_amount}₽
-📈 Ваш новый баланс: {user_data[user_id]['balance']}₽
+📈 Ваш новый баланс: {get_balance(user_id)}₽
 
 Поздравляем с выигрышем!
     """
@@ -2011,7 +2602,7 @@ async def handle_cashout(query, user_id):
 # Изменение ставки
 async def change_bet(query, user_id):
     """Изменение ставки"""
-    balance = user_data[user_id]["balance"]
+    balance = get_balance(user_id)
     current_bet = game_data[user_id]["bet"] if user_id in game_data and "bet" in game_data[user_id] else MIN_BET
     
     saved_bet = user_bets.get(user_id, None)
@@ -2045,7 +2636,156 @@ async def change_bet(query, user_id):
         reply_markup=reply_markup
     )
 
-# Основная функция
+# Меню топа игроков
+async def show_top_menu(query, user_id):
+    """Показывает топ игроков"""
+    # Получаем топ-10 по балансу
+    top_by_balance = db.get_top_users_by_balance(10)
+    
+    # Получаем топ-5 по выигрышам
+    top_by_wins = db.get_top_users_by_wins(5)
+    
+    # Формируем текст топа по балансу
+    top_balance_text = ""
+    if top_by_balance:
+        for i, user in enumerate(top_by_balance, 1):
+            username = user['username'] or user['first_name'] or f"ID: {user['user_id']}"
+            emoji = "👑" if i == 1 else "🥈" if i == 2 else "🥉" if i == 3 else f"{i}."
+            top_balance_text += f"{emoji} {username}: <b>{user['balance']:,}₽</b>\n"
+    else:
+        top_balance_text = "Пока никто не пополнил баланс 😔\n"
+    
+    # Формируем текст топа по выигрышам
+    top_wins_text = ""
+    if top_by_wins:
+        for i, user in enumerate(top_by_wins[:5], 1):
+            username = user['username'] or user['first_name'] or f"ID: {user['user_id']}"
+            emoji = "🏆" if i == 1 else "🎖️" if i == 2 else "⭐" if i == 3 else f"{i}."
+            games_count = user['total_games']
+            win_rate = (user['total_won'] / (user['total_won'] + games_count * 100)) * 100 if games_count > 0 else 0
+            top_wins_text += f"{emoji} {username}: <b>{user['total_won']:,}₽</b> ({games_count} игр)\n"
+    else:
+        top_wins_text = "Пока никто не выигрывал 😔\n"
+    
+    # Проверяем, выдавались ли сегодня награды
+    today_str = datetime.now().strftime("%Y-%m-%d")
+    rewards_given_today = db.check_daily_reward_given(today_str)
+    
+    reward_info = "✅ Сегодня награды уже выданы" if rewards_given_today else "⏳ Награды будут выданы сегодня в 00:00"
+    
+    # Получаем позицию текущего пользователя в топе
+    user_position = None
+    user_balance = get_balance(user_id)
+    if user_balance > 0 and top_by_balance:
+        for i, user in enumerate(top_by_balance, 1):
+            if user['user_id'] == user_id:
+                user_position = i
+                break
+    
+    user_position_text = ""
+    if user_position:
+        user_position_text = f"\n🎯 <b>Ваша позиция в топе:</b> {user_position} место\n"
+    elif user_balance > 0:
+        user_position_text = f"\n🎯 <b>Ваша позиция в топе:</b> ниже 10-го места\n"
+    
+    top_text = f"""
+<b>🏆 Топ игроков Spindja Casino</b>
+
+💰 <b>Топ по балансу:</b>
+{top_balance_text}
+
+🎯 <b>Топ по выигрышам:</b>
+{top_wins_text}
+{user_position_text}
+🎁 <b>Ежедневные награды:</b>
+Каждый день топ-3 игрока по балансу получают по <b>100₽</b>
+{reward_info}
+
+💡 <b>Как попасть в топ?</b>
+• Пополняйте баланс (от {MIN_DEPOSIT}₽)
+• Играйте и выигрывайте
+• Переводите средства друзьям
+    """
+    
+    keyboard = [
+        [InlineKeyboardButton("Мой баланс", callback_data="balance")],
+        [InlineKeyboardButton("Пополнить баланс", callback_data="deposit")],
+        [InlineKeyboardButton("Казна бота", callback_data="show_reserve")],
+        [InlineKeyboardButton("Назад", callback_data="back_to_main")]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    await query.edit_message_text(
+        text=top_text,
+        parse_mode='HTML',
+        reply_markup=reply_markup
+    )
+
+# Меню казны бота
+async def show_reserve_menu(query, user_id):
+    """Показывает казну бота"""
+    # Генерируем случайную сумму для казны
+    reserve_amount = random.randint(100000, 500000)  # от 100к до 500к
+    
+    # Создаем красивый вывод
+    reserve_text = f"""
+<b>💰 Казна бота</b>
+
+💎 <b>Баланс казны:</b> {reserve_amount:,}₽
+
+📊 <b>Информация:</b>
+Казна бота пополняется за счет комиссий с игр и пополнений.
+Средства из казны используются для выплат выигрышей и бонусов.
+
+💡 <b>Для пополнения/вывода:</b>
+Обращайтесь к администратору {ADMIN_USERNAME}
+    """
+    
+    keyboard = [
+        [InlineKeyboardButton(f"Связаться с {ADMIN_USERNAME}", url=f"https://t.me/{ADMIN_USERNAME[1:]}")],
+        [InlineKeyboardButton("Обновить казну", callback_data="refresh_reserve")],
+        [InlineKeyboardButton("Назад", callback_data="back_to_main")]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    await query.edit_message_text(
+        text=reserve_text,
+        parse_mode='HTML',
+        reply_markup=reply_markup
+    )
+
+# Обновление казны
+async def refresh_reserve(query, user_id):
+    """Обновляет казну бота"""
+    # Генерируем новую случайную сумму
+    reserve_amount = random.randint(100000, 500000)
+    
+    reserve_text = f"""
+<b>💰 Казна бота (обновлено)</b>
+
+💎 <b>Баланс казны:</b> {reserve_amount:,}₽
+
+📊 Казна обновлена! Сумма изменена.
+    """
+    
+    keyboard = [
+        [InlineKeyboardButton(f"Связаться с {ADMIN_USERNAME}", url=f"https://t.me/{ADMIN_USERNAME[1:]}")],
+        [InlineKeyboardButton("Обновить еще раз", callback_data="refresh_reserve")],
+        [InlineKeyboardButton("Назад", callback_data="back_to_main")]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    await query.edit_message_text(
+        text=reserve_text,
+        parse_mode='HTML',
+        reply_markup=reply_markup
+    )
+
+# ========== ОСНОВНАЯ ФУНКЦИЯ ==========
+async def scheduled_daily_rewards(context: ContextTypes.DEFAULT_TYPE):
+    """Планировщик для ежедневных наград"""
+    await check_and_give_daily_rewards(context)
+
 def main() -> None:
     """Запуск бота"""
     application = Application.builder().token(TOKEN).build()
@@ -2055,6 +2795,8 @@ def main() -> None:
     application.add_handler(CommandHandler("givemoney", givemoney))
     application.add_handler(CommandHandler("game", game_command))
     application.add_handler(CommandHandler("delbalance", delbalance))
+    application.add_handler(CommandHandler("reserve", reserve_command))
+    application.add_handler(CommandHandler("top", top_command))
     
     # Команды для баланса и переводов
     application.add_handler(CommandHandler("balance", balance_command))
@@ -2087,16 +2829,31 @@ def main() -> None:
         handle_text_message
     ))
     
-    print("=" * 50)
-    print("Бот запущен...")
-    print("=" * 50)
-    print(f"Администратор: {ADMIN_ID} ({ADMIN_USERNAME})")
-    print("\n📊 Команды баланса:")
+    # Настраиваем планировщик для ежедневных наград
+    job_queue = application.job_queue
+    if job_queue:
+        # Проверяем каждые 30 минут
+        job_queue.run_repeating(
+            scheduled_daily_rewards,
+            interval=1800,  # 30 минут в секундах
+            first=10
+        )
+    
+    print("=" * 60)
+    print("🎰 Spindja Casino Бот запущен...")
+    print("=" * 60)
+    print(f"📁 База данных: casino.db")
+    print(f"💰 Начальный баланс: {INITIAL_BALANCE}₽")
+    print(f"⚙️ Администратор: {ADMIN_ID} ({ADMIN_USERNAME})")
+    print(f"💎 Минимальное пополнение: {MIN_DEPOSIT}₽")
+    print(f"💸 Минимальный вывод: {MIN_WITHDRAWAL}₽")
+    print("\n📊 Основные команды:")
     print("• /balance / /bal / /b - показать баланс")
-    print("• /pay сумма - перевести другу (ответом на сообщение)")
-    print("• /pay ID сумма - перевести по ID пользователя")
+    print("• /top - топ игроков по балансу")
+    print("• /reserve - казна бота (случайная сумма)")
+    print("• /pay сумма - перевести другу")
     print(f"• Пополнение: от {MIN_DEPOSIT}₽ через {ADMIN_USERNAME}")
-    print(f"• Вывод: от {MIN_WITHDRAWAL}₽ через {ADMIN_USERNAME}")
+    print(f"• Вывод: от {MIN_WITHDRAWAL}₽ через {ADMIN_USERNAME} (крипто приоритет)")
     print("\n🎮 Игры:")
     print("• Напишите 'мины' - игра в мины (2 мины, x1.12)")
     print("• Напишите 'кубы' - игра в кубы (анимированные кубики)")
@@ -2106,11 +2863,14 @@ def main() -> None:
     print("• /number число сумма - ставка на число (1-6) - x6")
     print("• /more сумма - ставка на больше (4-6) - x2")
     print("• /less сумма - ставка на меньше (1-3) - x2")
+    print("\n🎁 Ежедневные награды:")
+    print("• Топ-3 игрока по балансу получают по 100₽ каждый день")
+    print("• Награды выдаются автоматически в 00:00")
     print("\n⚙️ Для админа:")
     print("• /givemoney ID сумма - выдать баланс")
     print("• /delbalance ID сумма - снять баланс")
     print("• /game mines номер - просмотр информации об игре")
-    print("=" * 50)
+    print("=" * 60)
     
     # Запускаем бота
     application.run_polling(allowed_updates=Update.ALL_TYPES)
