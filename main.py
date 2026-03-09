@@ -1,7 +1,8 @@
 import asyncio
 import logging
-from datetime import datetime
-from typing import Union
+import random
+from datetime import datetime, timedelta
+from typing import Union, Optional
 
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.client.default import DefaultBotProperties
@@ -18,7 +19,6 @@ from aiogram.fsm.storage.memory import MemoryStorage
 
 # Для рассылки по расписанию
 import aioschedule
-import asyncio
 
 # Для работы с базой данных (используем простой JSON)
 import json
@@ -68,6 +68,7 @@ def get_user(user_id: int) -> dict:
             "balance": 0,
             "registered_at": datetime.now().isoformat(),
             "last_claim_time": None,  # Для отслеживания последнего получения печеньки
+            "last_bonus_time": None,  # Для отслеживания последнего получения бонуса
             "username": None
         }
         save_db(db)
@@ -103,6 +104,30 @@ def get_user_place(user_id: int) -> int:
             return index + 1
     return 0  # Не найден
 
+def can_claim_bonus(user_id: int) -> tuple[bool, Optional[int]]:
+    """
+    Проверяет, может ли пользователь получить бонус.
+    Возвращает (можно ли получить, сколько секунд осталось до следующего бонуса)
+    """
+    user_data = get_user(user_id)
+    last_bonus = user_data.get('last_bonus_time')
+    
+    if not last_bonus:
+        return True, 0
+    
+    last_bonus_time = datetime.fromisoformat(last_bonus)
+    time_diff = datetime.now() - last_bonus_time
+    
+    # Бонус можно получать раз в 2 часа (7200 секунд)
+    cooldown = 7200  # 2 часа в секундах
+    elapsed = time_diff.total_seconds()
+    
+    if elapsed >= cooldown:
+        return True, 0
+    else:
+        remaining = int(cooldown - elapsed)
+        return False, remaining
+
 # ==== FSM для админки (рассылка) ====
 class AdminStates(StatesGroup):
     waiting_for_broadcast = State()  # Ждем текст рассылки
@@ -112,13 +137,14 @@ class AdminStates(StatesGroup):
 
 # ==== Генерация клавиатур (Inline) ====
 def main_menu_keyboard():
-    """Главное меню (4 кнопки)."""
+    """Главное меню (5 кнопок)."""
     builder = InlineKeyboardBuilder()
     builder.button(text="👤 Профиль", callback_data="profile")
     builder.button(text="🏆 Топ", callback_data="top")
     builder.button(text="❓ Помощь", callback_data="help")
     builder.button(text="💎 Донат", callback_data="donate")
-    builder.adjust(2)  # по 2 кнопки в ряд
+    builder.button(text="📋 Команды", callback_data="commands")
+    builder.adjust(2, 2, 1)  # по 2, 2 и 1 кнопка в ряд
     return builder.as_markup()
 
 def back_button_keyboard():
@@ -151,6 +177,15 @@ def claim_keyboard(claim_id: str):
     builder.button(text="🍪 Забрать печеньку!", callback_data=f"claim_{claim_id}")
     return builder.as_markup()
 
+def commands_keyboard():
+    """Клавиатура для раздела команд."""
+    builder = InlineKeyboardBuilder()
+    builder.button(text="🍪 /bonus", callback_data="info_bonus")
+    builder.button(text="👤 /start", callback_data="info_start")
+    builder.button(text="🔙 Назад", callback_data="back_to_main")
+    builder.adjust(2, 1)
+    return builder.as_markup()
+
 # ==== Команда /start ====
 @dp.message(CommandStart())
 async def command_start_handler(message: Message) -> None:
@@ -164,22 +199,97 @@ async def command_start_handler(message: Message) -> None:
     # Красивое приветствие
     text = (
         f"🥰 <b>Приветик, {user.full_name}!</b>\n\n"
-        f"Я - бот для раздачи печенек за активность в нашем "
+        f"➖➖➖➖➖➖➖➖➖➖\n\n"
+        f"🐾 <b>Я - бот для раздачи печенек</b> за активность в нашем "
         f"<a href='{CHANNEL_LINK}'>Telegram канале</a>.\n\n"
-        f"🍪 В конце каждого месяца подводятся итоги, а топ-10 охотников "
+        f"🍪 <b>В конце каждого месяца</b> подводятся итоги, а топ-10 охотников "
         f"получают крутые вознаграждения на нашем сервере!\n\n"
+        f"🎯 <b>Команды бота:</b>\n"
+        f"• <code>/bonus</code> — получить бонусные печеньки (раз в 2 часа)\n"
+        f"➖➖➖➖➖➖➖➖➖➖\n\n"
         f"😎 <b>Вперед на Охоту за Печеньками!</b>\n"
-        f"Покажи всем, кто здесь BOSS!"
+        f"<blockquote>Покажи всем, кто здесь BOSS!</blockquote>"
     )
 
     await message.answer(text, reply_markup=main_menu_keyboard(), disable_web_page_preview=True)
+
+# ==== Команда /bonus (только в групповом чате) ====
+@dp.message(Command("bonus"))
+async def bonus_command_handler(message: Message) -> None:
+    """Обработчик команды /bonus - выдача случайного бонуса раз в 2 часа."""
+    # Проверяем, что команда вызвана в нужном чате
+    if message.chat.id != GIVEAWAY_CHAT_ID:
+        return  # Игнорируем команду в других чатах
+    
+    user = message.from_user
+    user_id = user.id
+    
+    # Проверяем, можно ли получить бонус
+    can_get, remaining = can_claim_bonus(user_id)
+    
+    if not can_get:
+        # Форматируем время ожидания
+        hours = remaining // 3600
+        minutes = (remaining % 3600) // 60
+        seconds = remaining % 60
+        
+        time_text = ""
+        if hours > 0:
+            time_text += f"{hours} ч. "
+        if minutes > 0:
+            time_text += f"{minutes} мин. "
+        if seconds > 0 and hours == 0:
+            time_text += f"{seconds} сек."
+        
+        await message.reply(
+            f"⏳ <b>Бонус пока недоступен!</b>\n\n"
+            f"🍪 Ты уже получал бонус недавно.\n"
+            f"📅 Следующий бонус будет доступен через: <b>{time_text}</b>\n\n"
+            f"<i>Возвращайся позже и забирай свою печеньку!</i>"
+        )
+        return
+    
+    # Генерируем случайное количество печенек от 1 до 20
+    bonus_amount = random.randint(1, 20)
+    
+    # Обновляем баланс и время последнего бонуса
+    user_data = get_user(user_id)
+    current_balance = user_data.get('balance', 0)
+    new_balance = current_balance + bonus_amount
+    
+    user_data['balance'] = new_balance
+    user_data['last_bonus_time'] = datetime.now().isoformat()
+    update_user(user_id, user_data)
+    
+    # Отправляем сообщение о получении бонуса
+    await message.reply(
+        f"🎉 <b>БОНУС ПОЛУЧЕН!</b>\n\n"
+        f"🍪 Ты получил: <b>{bonus_amount} печенек</b>\n"
+        f"💰 Текущий баланс: <b>{new_balance} 🍪</b>\n\n"
+        f"📅 Следующий бонус будет доступен через 2 часа.\n"
+        f"<blockquote>Не забывай заходить за новыми печеньками!</blockquote>"
+    )
+    
+    # Уведомляем админов о получении бонуса
+    for admin_id in ADMIN_IDS:
+        try:
+            await bot.send_message(
+                admin_id,
+                f"🎁 <b>Бонус получен!</b>\n\n"
+                f"👤 Пользователь: {user.full_name}\n"
+                f"🆔 ID: <code>{user_id}</code>\n"
+                f"🍪 Получил: {bonus_amount} печенек\n"
+                f"💰 Текущий баланс: {new_balance} 🍪"
+            )
+        except:
+            pass
 
 # ==== Обработчики Inline кнопок (Callback) ====
 @dp.callback_query(F.data == "back_to_main")
 async def back_to_main(callback: CallbackQuery):
     """Возврат в главное меню."""
     await callback.message.edit_text(
-        text="🥰 Главное меню",
+        text="🥰 <b>Главное меню</b>\n\n<i>Выбери нужный раздел:</i>",
         reply_markup=main_menu_keyboard()
     )
     await callback.answer()
@@ -197,12 +307,14 @@ async def show_profile(callback: CallbackQuery):
     place = get_user_place(user.id)
 
     text = (
-        f"⭐ <b>Твой профиль:</b>\n\n"
-        f"👤 Ник: {user.full_name}\n"
-        f"📱 ID: <code>{user.id}</code>\n"
-        f"🗓️ Дата регистрации: {reg_date}\n\n"
-        f"💰 В твоем мешке: <b>{balance} 🍪</b>\n"
-        f"📊 Позиция в топе: <b>{place} Место</b>"
+        f"⭐ <b>ПРОФИЛЬ ПОЛЬЗОВАТЕЛЯ</b>\n"
+        f"➖➖➖➖➖➖➖➖➖➖\n\n"
+        f"👤 <b>Никнейм:</b> {user.full_name}\n"
+        f"📱 <b>ID:</b> <code>{user.id}</code>\n"
+        f"🗓 <b>Регистрация:</b> {reg_date}\n\n"
+        f"💰 <b>В твоем мешке:</b> <code>{balance} 🍪</code>\n"
+        f"📊 <b>Позиция в топе:</b> <code>{place} место</code>\n"
+        f"➖➖➖➖➖➖➖➖➖➖"
     )
 
     await callback.message.edit_text(text, reply_markup=back_button_keyboard())
@@ -217,7 +329,11 @@ async def show_top(callback: CallbackQuery):
     balance = get_user(user.id).get('balance', 0)
     place = get_user_place(user.id)
 
-    text = "🏆 <b>Топ Охотников за Печеньем:</b>\n(самые крутые ребята)\n\n"
+    text = (
+        f"🏆 <b>ТОП ОХОТНИКОВ ЗА ПЕЧЕНЬЕМ</b>\n"
+        f"<i>(самые крутые ребята)</i>\n"
+        f"➖➖➖➖➖➖➖➖➖➖\n\n"
+    )
 
     medals = ["🥇", "🥈", "🥉", "🏅", "🏅"]
     for i, (user_id_str, user_info) in enumerate(top_users):
@@ -229,10 +345,14 @@ async def show_top(callback: CallbackQuery):
         else:
             display_name = f"ID {user_id_str}"
 
-        text += f"{medals[i]} {i+1} Место: {display_name} ({user_info.get('balance', 0)} 🍪)\n"
+        text += f"{medals[i]} <b>{i+1} место:</b> {display_name} — <code>{user_info.get('balance', 0)} 🍪</code>\n"
 
-    text += f"\n💰 В твоем мешке: <b>{balance} 🍪</b>\n"
-    text += f"📊 Позиция в топе: <b>{place} Место</b>"
+    text += (
+        f"\n➖➖➖➖➖➖➖➖➖➖\n"
+        f"💰 <b>В твоем мешке:</b> <code>{balance} 🍪</code>\n"
+        f"📊 <b>Твоя позиция:</b> <code>{place} место</code>\n"
+        f"➖➖➖➖➖➖➖➖➖➖"
+    )
 
     await callback.message.edit_text(text, reply_markup=back_button_keyboard())
     await callback.answer()
@@ -242,11 +362,82 @@ async def show_top(callback: CallbackQuery):
 async def show_help(callback: CallbackQuery):
     """Показывает раздел помощи."""
     text = (
-        "❓ <b>Помощь:</b>\n\n"
-        "😉 Если что-то не понятно, воспользуйся кнопочным меню.\n"
-        "Печеньки выдаются каждый час в нашем канале. Жми кнопку 'Забрать' и будь первым!"
+        f"❓ <b>РАЗДЕЛ ПОМОЩИ</b>\n"
+        f"➖➖➖➖➖➖➖➖➖➖\n\n"
+        f"<b>Как получать печеньки?</b>\n"
+        f"🍪 Печеньки выдаются каждый час в нашем канале.\n"
+        f"• Жми кнопку <b>'Забрать печеньку!'</b>\n"
+        f"• Будь первым — получи +5 печенек!\n\n"
+        f"🎁 <b>Бонусная система:</b>\n"
+        f"• Введи команду <code>/bonus</code> в чате\n"
+        f"• Получай от 1 до 20 печенек раз в 2 часа\n\n"
+        f"📊 <b>Топ пользователей:</b>\n"
+        f"• В конце месяца топ-10 получают награды\n"
+        f"• Следи за своим рейтингом в разделе 'Топ'\n"
+        f"➖➖➖➖➖➖➖➖➖➖"
     )
     await callback.message.edit_text(text, reply_markup=support_keyboard())
+    await callback.answer()
+
+# ---- Команды ----
+@dp.callback_query(F.data == "commands")
+async def show_commands(callback: CallbackQuery):
+    """Показывает раздел с командами."""
+    text = (
+        f"📋 <b>ДОСТУПНЫЕ КОМАНДЫ</b>\n"
+        f"➖➖➖➖➖➖➖➖➖➖\n\n"
+        f"<b>👤 Основные команды:</b>\n"
+        f"• <code>/start</code> — запуск бота и главное меню\n"
+        f"• <code>/bonus</code> — получить бонус (раз в 2 часа, только в чате)\n\n"
+        f"<b>👑 Админ-команды:</b>\n"
+        f"• <code>/admin</code> — панель администратора\n\n"
+        f"<b>💡 Как использовать /bonus:</b>\n"
+        f"• Команда работает только в чате канала\n"
+        f"• Дает от 1 до 20 печенек случайно\n"
+        f"• Доступна раз в 2 часа для каждого\n"
+        f"➖➖➖➖➖➖➖➖➖➖"
+    )
+    await callback.message.edit_text(text, reply_markup=commands_keyboard())
+    await callback.answer()
+
+@dp.callback_query(F.data == "info_bonus")
+async def info_bonus(callback: CallbackQuery):
+    """Подробная информация о команде /bonus."""
+    text = (
+        f"🍪 <b>КОМАНДА /bonus</b>\n"
+        f"➖➖➖➖➖➖➖➖➖➖\n\n"
+        f"<b>📌 Описание:</b>\n"
+        f"Команда для получения бонусных печенек в чате канала.\n\n"
+        f"<b>⚙️ Параметры:</b>\n"
+        f"• 🎲 <b>Количество:</b> от 1 до 20 печенек (случайно)\n"
+        f"• ⏰ <b>Перезарядка:</b> 2 часа\n"
+        f"• 📍 <b>Где работает:</b> только в чате канала\n\n"
+        f"<b>💬 Пример использования:</b>\n"
+        f"<code>/bonus</code> — ввести в чате канала\n\n"
+        f"<blockquote>Не забывай заходить каждые 2 часа за новой порцией печенек!</blockquote>\n"
+        f"➖➖➖➖➖➖➖➖➖➖"
+    )
+    await callback.message.edit_text(text, reply_markup=commands_keyboard())
+    await callback.answer()
+
+@dp.callback_query(F.data == "info_start")
+async def info_start(callback: CallbackQuery):
+    """Подробная информация о команде /start."""
+    text = (
+        f"👤 <b>КОМАНДА /start</b>\n"
+        f"➖➖➖➖➖➖➖➖➖➖\n\n"
+        f"<b>📌 Описание:</b>\n"
+        f"Основная команда для запуска бота и регистрации пользователя.\n\n"
+        f"<b>⚙️ Что делает:</b>\n"
+        f"• ✅ Регистрирует тебя в системе\n"
+        f"• 📊 Показывает главное меню\n"
+        f"• 👤 Обновляет твой профиль\n\n"
+        f"<b>💬 Пример использования:</b>\n"
+        f"<code>/start</code> — ввести в личных сообщениях с ботом\n\n"
+        f"<blockquote>После /start ты можешь пользоваться всеми функциями бота!</blockquote>\n"
+        f"➖➖➖➖➖➖➖➖➖➖"
+    )
+    await callback.message.edit_text(text, reply_markup=commands_keyboard())
     await callback.answer()
 
 # ---- Донат ----
@@ -254,10 +445,12 @@ async def show_help(callback: CallbackQuery):
 async def show_donate(callback: CallbackQuery):
     """Показывает раздел доната."""
     text = (
-        "💎 <b>Поддержка проекта.</b>\n\n"
-        "❤️ Если тебе понравился бот и ты хочешь поддержать его развитие, "
-        "можешь сделать добровольное пожертвование.\n\n"
-        "🙃 Для этого просто выбери желаемую сумму:"
+        f"💎 <b>ПОДДЕРЖКА ПРОЕКТА</b>\n"
+        f"➖➖➖➖➖➖➖➖➖➖\n\n"
+        f"❤️ Если тебе понравился бот и ты хочешь поддержать его развитие, "
+        f"можешь сделать добровольное пожертвование.\n\n"
+        f"🙃 <b>Выбери желаемую сумму:</b>\n"
+        f"➖➖➖➖➖➖➖➖➖➖"
     )
     await callback.message.edit_text(text, reply_markup=donate_keyboard())
     await callback.answer()
@@ -267,8 +460,12 @@ async def process_donate(callback: CallbackQuery):
     """Обработка выбора суммы доната."""
     amount = callback.data.split("_")[1]
     await callback.message.edit_text(
-        f"💎 Отправьте подарок на пользователя: @Dev_pranik\n"
-        f"(Выбрано: {amount} звёзд)",
+        f"💎 <b>ПОДДЕРЖКА ПРОЕКТА</b>\n"
+        f"➖➖➖➖➖➖➖➖➖➖\n\n"
+        f"✅ Выбрано: <b>{amount} звёзд</b>\n\n"
+        f"📤 Отправьте подарок на пользователя: <code>@Dev_pranik</code>\n\n"
+        f"<i>После отправки звезд напишите в поддержку для подтверждения и получения бонусов!</i>\n"
+        f"➖➖➖➖➖➖➖➖➖➖",
         reply_markup=back_button_keyboard()
     )
     await callback.answer()
@@ -288,9 +485,11 @@ async def send_cookie_giveaway():
     active_claims[claim_id] = None  # Пока никто не забрал
 
     text = (
-        "🍪 <b>РАЗДАЧА ПЕЧЕНЬЕК!</b>\n\n"
-        "Кто первый нажмёт кнопку — тот получит +5 печенек!\n"
-        "Торопись, удача любит смелых!"
+        f"🍪 <b>РАЗДАЧА ПЕЧЕНЬЕК!</b>\n"
+        f"➖➖➖➖➖➖➖➖➖➖\n\n"
+        f"🔥 <b>Кто первый нажмёт кнопку</b> — тот получит +5 печенек!\n\n"
+        f"⚡️ <i>Торопись, удача любит смелых!</i>\n"
+        f"➖➖➖➖➖➖➖➖➖➖"
     )
 
     try:
@@ -307,7 +506,9 @@ async def send_cookie_giveaway():
             try:
                 await bot.send_message(
                     admin_id,
-                    f"✅ Раздача успешно отправлена в чат!\nID раздачи: {claim_id}"
+                    f"✅ <b>Раздача успешно отправлена</b>\n"
+                    f"📋 ID раздачи: <code>{claim_id}</code>\n"
+                    f"📍 Чат: <code>{GIVEAWAY_CHAT_ID}</code>"
                 )
             except:
                 pass
@@ -319,7 +520,7 @@ async def send_cookie_giveaway():
         # Уведомляем админов об ошибке
         for admin_id in ADMIN_IDS:
             try:
-                await bot.send_message(admin_id, error_text)
+                await bot.send_message(admin_id, f"❌ <b>Ошибка раздачи</b>\n\n{error_text}")
             except:
                 pass
 
@@ -347,9 +548,11 @@ async def process_claim(callback: CallbackQuery):
     update_user(user_id, user_data)
 
     await callback.message.edit_text(
-        f"🎉 Поздравляю, {callback.from_user.full_name}!\n"
-        f"Ты успел первым и получил +5 🍪!\n"
-        f"Теперь в твоём мешке: {new_balance} 🍪."
+        f"🎉 <b>ПОЗДРАВЛЯЮ, {callback.from_user.full_name}!</b>\n"
+        f"➖➖➖➖➖➖➖➖➖➖\n\n"
+        f"🍪 Ты успел первым и получил <b>+5 печенек</b>!\n"
+        f"💰 Теперь в твоём мешке: <b>{new_balance} 🍪</b>\n"
+        f"➖➖➖➖➖➖➖➖➖➖"
     )
     await callback.answer("✅ Ты получил 5 печенек!", show_alert=True)
     
@@ -358,8 +561,10 @@ async def process_claim(callback: CallbackQuery):
         try:
             await bot.send_message(
                 admin_id,
-                f"🍪 Печеньку получил: {callback.from_user.full_name} (ID: {user_id})\n"
-                f"Теперь у него {new_balance} 🍪"
+                f"🍪 <b>Печеньку получил!</b>\n\n"
+                f"👤 Пользователь: {callback.from_user.full_name}\n"
+                f"🆔 ID: <code>{user_id}</code>\n"
+                f"💰 Текущий баланс: {new_balance} 🍪"
             )
         except:
             pass
@@ -373,12 +578,14 @@ def is_admin(user_id: int) -> bool:
 async def admin_panel(message: Message):
     """Панель администратора."""
     if not is_admin(message.from_user.id):
-        await message.answer("⛔ Доступ запрещён.")
+        await message.answer("⛔ <b>Доступ запрещён.</b>\n\n<i>Эта команда только для администраторов.</i>")
         return
 
     text = (
-        "👑 <b>Панель администратора</b>\n\n"
-        "Выберите действие:"
+        f"👑 <b>ПАНЕЛЬ АДМИНИСТРАТОРА</b>\n"
+        f"➖➖➖➖➖➖➖➖➖➖\n\n"
+        f"<b>Выберите действие:</b>\n"
+        f"➖➖➖➖➖➖➖➖➖➖"
     )
     builder = InlineKeyboardBuilder()
     builder.button(text="📢 Сделать рассылку", callback_data="admin_broadcast")
@@ -401,21 +608,25 @@ async def admin_actions(callback: CallbackQuery, state: FSMContext):
 
     if action == "admin_broadcast":
         await callback.message.edit_text(
-            "📢 Введите текст для рассылки всем пользователям:"
+            "📢 <b>Создание рассылки</b>\n\n"
+            "Введите текст для рассылки всем пользователям:\n"
+            "<i>(можно использовать HTML-разметку)</i>"
         )
         await state.set_state(AdminStates.waiting_for_broadcast)
         await callback.answer()
 
     elif action == "admin_change_balance":
         await callback.message.edit_text(
-            "💰 Введите ID пользователя, которому хотите изменить баланс:"
+            "💰 <b>Изменение баланса</b>\n\n"
+            "Введите ID пользователя, которому хотите изменить баланс:"
         )
         await state.set_state(AdminStates.waiting_for_user_id_balance)
         await callback.answer()
 
     elif action == "admin_reset_balance":
         await callback.message.edit_text(
-            "🔄 Введите ID пользователя для сброса баланса (поставьте 0):"
+            "🔄 <b>Сброс баланса</b>\n\n"
+            "Введите ID пользователя для сброса баланса:"
         )
         await state.set_state(AdminStates.waiting_for_user_id_reset)
         await callback.answer()
@@ -424,11 +635,19 @@ async def admin_actions(callback: CallbackQuery, state: FSMContext):
         db = get_all_users()
         total_users = len(db)
         total_cookies = sum(u.get('balance', 0) for u in db.values())
+        avg_cookies = total_cookies / max(total_users, 1)
+        
+        # Подсчет пользователей с балансом > 0
+        active_users = sum(1 for u in db.values() if u.get('balance', 0) > 0)
+        
         await callback.message.edit_text(
-            f"📊 <b>Статистика</b>\n\n"
-            f"👥 Всего пользователей: {total_users}\n"
-            f"🍪 Всего печенек: {total_cookies}\n"
-            f"⭐ Среднее печенек: {total_cookies / max(total_users, 1):.1f}",
+            f"📊 <b>СТАТИСТИКА БОТА</b>\n"
+            f"➖➖➖➖➖➖➖➖➖➖\n\n"
+            f"👥 <b>Всего пользователей:</b> <code>{total_users}</code>\n"
+            f"✨ <b>Активных пользователей:</b> <code>{active_users}</code>\n"
+            f"🍪 <b>Всего печенек:</b> <code>{total_cookies}</code>\n"
+            f"📈 <b>Среднее печенек:</b> <code>{avg_cookies:.1f}</code>\n"
+            f"➖➖➖➖➖➖➖➖➖➖",
             reply_markup=back_button_keyboard()
         )
         await callback.answer()
@@ -436,7 +655,9 @@ async def admin_actions(callback: CallbackQuery, state: FSMContext):
     elif action == "admin_test_giveaway":
         await send_cookie_giveaway()  # Отправляем тестовую раздачу
         await callback.message.edit_text(
-            "✅ Тестовая раздача отправлена в указанный чат.",
+            f"✅ <b>Тестовая раздача отправлена</b>\n\n"
+            f"📍 Чат: <code>{GIVEAWAY_CHAT_ID}</code>\n"
+            f"➖➖➖➖➖➖➖➖➖➖",
             reply_markup=back_button_keyboard()
         )
         await callback.answer()
@@ -453,7 +674,10 @@ async def process_broadcast(message: Message, state: FSMContext):
         return
 
     broadcast_text = message.text
-    await message.answer(f"Начинаю рассылку...\nТекст:\n{broadcast_text}")
+    status_msg = await message.answer(
+        f"📢 <b>Начинаю рассылку...</b>\n\n"
+        f"<b>Текст:</b>\n<blockquote>{broadcast_text}</blockquote>"
+    )
 
     db = get_all_users()
     sent = 0
@@ -462,12 +686,22 @@ async def process_broadcast(message: Message, state: FSMContext):
         try:
             await bot.send_message(int(user_id_str), broadcast_text)
             sent += 1
+            if sent % 10 == 0:  # Обновляем статус каждые 10 отправок
+                await status_msg.edit_text(
+                    f"📢 <b>Рассылка в процессе...</b>\n\n"
+                    f"✅ Отправлено: <code>{sent}</code>\n"
+                    f"❌ Ошибок: <code>{failed}</code>"
+                )
             await asyncio.sleep(0.05)  # Небольшая задержка, чтобы не спамить
         except Exception as e:
             failed += 1
             logging.error(f"Не удалось отправить пользователю {user_id_str}: {e}")
 
-    await message.answer(f"✅ Рассылка завершена.\nОтправлено: {sent}\nОшибок: {failed}")
+    await status_msg.edit_text(
+        f"📢 <b>Рассылка завершена</b>\n\n"
+        f"✅ <b>Успешно отправлено:</b> <code>{sent}</code>\n"
+        f"❌ <b>Ошибок доставки:</b> <code>{failed}</code>"
+    )
     await state.clear()
 
 # Изменение баланса
@@ -479,10 +713,14 @@ async def process_user_id_for_balance(message: Message, state: FSMContext):
         # Проверяем, есть ли такой пользователь
         get_user(user_id)  # Создаст, если нет
         await state.update_data(target_user_id=user_id)
-        await message.answer("Введите сумму изменения (например: +5 или -3):")
+        await message.answer(
+            f"💰 <b>Изменение баланса</b>\n\n"
+            f"🆔 Пользователь: <code>{user_id}</code>\n"
+            f"Введите сумму изменения (например: <code>+5</code> или <code>-3</code>):"
+        )
         await state.set_state(AdminStates.waiting_for_balance_amount)
     except ValueError:
-        await message.answer("❌ Некорректный ID. Введите число.")
+        await message.answer("❌ <b>Ошибка</b>\n\nНекорректный ID. Введите число.")
 
 @dp.message(AdminStates.waiting_for_balance_amount)
 async def process_balance_amount(message: Message, state: FSMContext):
@@ -500,10 +738,14 @@ async def process_balance_amount(message: Message, state: FSMContext):
         user_data['balance'] = new_balance
         update_user(user_id, user_data)
 
-        await message.answer(f"✅ Баланс пользователя {user_id} изменён.\n"
-                             f"Было: {current}, стало: {new_balance} 🍪")
+        await message.answer(
+            f"✅ <b>Баланс изменен</b>\n\n"
+            f"👤 Пользователь: <code>{user_id}</code>\n"
+            f"📊 Было: <code>{current} 🍪</code>\n"
+            f"📈 Стало: <code>{new_balance} 🍪</code>"
+        )
     except ValueError:
-        await message.answer("❌ Некорректная сумма.")
+        await message.answer("❌ <b>Ошибка</b>\n\nНекорректная сумма.")
     finally:
         await state.clear()
 
@@ -517,9 +759,13 @@ async def process_reset_balance(message: Message, state: FSMContext):
         old_balance = user_data.get('balance', 0)
         user_data['balance'] = 0
         update_user(user_id, user_data)
-        await message.answer(f"✅ Баланс пользователя {user_id} сброшен.\nБыло: {old_balance}")
+        await message.answer(
+            f"✅ <b>Баланс сброшен</b>\n\n"
+            f"👤 Пользователь: <code>{user_id}</code>\n"
+            f"📊 Предыдущий баланс: <code>{old_balance} 🍪</code>"
+        )
     except ValueError:
-        await message.answer("❌ Некорректный ID.")
+        await message.answer("❌ <b>Ошибка</b>\n\nНекорректный ID.")
     finally:
         await state.clear()
 
@@ -544,6 +790,20 @@ async def on_startup():
     try:
         chat = await bot.get_chat(GIVEAWAY_CHAT_ID)
         logging.info(f"✅ Чат для раздач доступен: {chat.title}")
+        
+        # Отправляем уведомление админам о запуске
+        for admin_id in ADMIN_IDS:
+            try:
+                await bot.send_message(
+                    admin_id,
+                    f"🚀 <b>Бот успешно запущен!</b>\n\n"
+                    f"📊 <b>Статус:</b>\n"
+                    f"• Чат для раздач: <code>{chat.title}</code>\n"
+                    f"• Планировщик: активен\n"
+                    f"• База данных: загружена"
+                )
+            except:
+                pass
     except Exception as e:
         logging.error(f"❌ Не удалось получить доступ к чату {GIVEAWAY_CHAT_ID}: {e}")
         logging.error("Убедитесь, что бот добавлен в чат и является администратором!")
