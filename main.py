@@ -1,16 +1,22 @@
 import asyncio
 import logging
 import random
+import uuid
+import re
 from datetime import datetime, timedelta
-from typing import Union, Optional
+from typing import Union, Optional, Dict, List, Any
+import json
+import os
+import time
 
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.client.default import DefaultBotProperties
-from aiogram.enums import ParseMode
+from aiogram.enums import ParseMode, ChatType
 from aiogram.filters import Command, CommandStart
 from aiogram.types import (
     InlineKeyboardMarkup, InlineKeyboardButton,
-    CallbackQuery, Message, FSInputFile
+    CallbackQuery, Message, InlineQueryResultArticle,
+    InputTextMessageContent
 )
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from aiogram.fsm.context import FSMContext
@@ -19,10 +25,6 @@ from aiogram.fsm.storage.memory import MemoryStorage
 
 # Для рассылки по расписанию
 import aioschedule
-
-# Для работы с базой данных (используем простой JSON)
-import json
-import os
 
 # Конфигурация
 BOT_TOKEN = "8729608216:AAH3u-dH3So6B96MAqVDospaiTATrzcekQo"
@@ -33,6 +35,7 @@ GIVEAWAY_CHAT_ID = -1003720079599  # ID чата для раздач
 
 # Файл базы данных
 DB_FILE = "users_db.json"
+CHECKS_FILE = "checks_db.json"
 
 # Настройка логирования
 logging.basicConfig(level=logging.INFO)
@@ -42,7 +45,53 @@ bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTM
 storage = MemoryStorage()
 dp = Dispatcher(storage=storage)
 
-# ==== Работа с базой данных (простая JSON "БД") ====
+# ==== Премиум эмодзи (ТОЛЬКО ДЛЯ ТЕКСТОВ, НЕ ДЛЯ АДМИНКИ) ====
+PREMIUM_EMOJIS = {
+    "rocket": ("🚀", "5377336433692412420"),
+    "dollar": ("💵", "5377852667286559564"),
+    "dice": ("🎲", "5377346496800786271"),
+    "transfer": ("🔄", "5377720025811555309"),
+    "lightning": ("⚡", "5375469677696815127"),
+    "casino": ("🎰", "5969709082049779216"),
+    "balance": ("💰", "5262509177363787445"),
+    "withdraw": ("💸", "5226731292334235524"),
+    "deposit": ("💳", "5226731292334235524"),
+    "game": ("🎮", "5258508428212445001"),
+    "mine": ("💣", "4979035365823219688"),
+    "win": ("🏆", "5436386989857320953"),
+    "lose": ("💥", "4979035365823219688"),
+    "prize": ("🎁", "5323761960829862762"),
+    "user": ("👤", "5168063997575956782"),
+    "stats": ("📊", "5231200819986047254"),
+    "time": ("⏰", "5258419835922030550"),
+    "min": ("📍", "5447183459602669338"),
+    "card": ("💳", "5902056028513505203"),
+    "rules": ("📋", "5258328383183396223"),
+    "info": ("ℹ️", "5258334872878980409"),
+    "back": ("↩️", "5877629862306385808"),
+    "play": ("▶️", "5467583879948803288"),
+    "bet": ("🎯", "5893048571560726748"),
+    "multiplier": ("📈", "5201691993775818138"),
+    "history": ("📜", "5353025608832004653"),
+    "check": ("🧾", "5902056028513505203"),
+    "users": ("👥", "5168063997575956782"),
+    "crown": ("👑", "5377311257601253397"),
+    "warning": ("⚠️", "5375469677696815127"),
+    "success": ("✅", "5375471152190916117"),
+    "error": ("❌", "5375471152190916117"),
+    "link": ("🔗", "5375469677696815127"),
+    "settings": ("⚙️", "5375469677696815127"),
+    "refresh": ("🔄", "5377720025811555309"),
+}
+
+def premium_emoji(name: str) -> str:
+    """Возвращает HTML-код для премиум эмодзи (только для текстов)."""
+    if name in PREMIUM_EMOJIS:
+        emoji, emoji_id = PREMIUM_EMOJIS[name]
+        return f'<tg-emoji emoji-id="{emoji_id}">{emoji}</tg-emoji>'
+    return name
+
+# ==== Работа с базой данных ====
 def load_db():
     """Загружает базу данных из файла."""
     if os.path.exists(DB_FILE):
@@ -58,18 +107,35 @@ def save_db(db):
     with open(DB_FILE, 'w', encoding='utf-8') as f:
         json.dump(db, f, ensure_ascii=False, indent=4)
 
+def load_checks():
+    """Загружает базу чеков из файла."""
+    if os.path.exists(CHECKS_FILE):
+        try:
+            with open(CHECKS_FILE, 'r', encoding='utf-8') as f:
+                return json.load(f)
+        except (json.JSONDecodeError, FileNotFoundError):
+            return {}
+    return {}
+
+def save_checks(checks):
+    """Сохраняет базу чеков в файл."""
+    with open(CHECKS_FILE, 'w', encoding='utf-8') as f:
+        json.dump(checks, f, ensure_ascii=False, indent=4)
+
 def get_user(user_id: int) -> dict:
     """Возвращает данные пользователя или создает нового."""
     db = load_db()
     user_id_str = str(user_id)
     if user_id_str not in db:
-        # Новый пользователь
         db[user_id_str] = {
             "balance": 0,
             "registered_at": datetime.now().isoformat(),
-            "last_claim_time": None,  # Для отслеживания последнего получения печеньки
-            "last_bonus_time": None,  # Для отслеживания последнего получения бонуса
-            "username": None
+            "last_claim_time": None,
+            "last_bonus_time": None,
+            "username": None,
+            "total_earned": 0,
+            "checks_created": 0,
+            "checks_activated": 0
         }
         save_db(db)
     return db[user_id_str]
@@ -91,7 +157,6 @@ def get_all_users() -> dict:
 def get_top_users(limit: int = 10) -> list:
     """Возвращает топ пользователей по балансу."""
     db = load_db()
-    # Сортируем по балансу (по убыванию) и берем первых limit
     sorted_users = sorted(db.items(), key=lambda item: item[1].get('balance', 0), reverse=True)
     return sorted_users[:limit]
 
@@ -102,13 +167,10 @@ def get_user_place(user_id: int) -> int:
     for index, (uid, _) in enumerate(sorted_users):
         if int(uid) == user_id:
             return index + 1
-    return 0  # Не найден
+    return 0
 
 def can_claim_bonus(user_id: int) -> tuple[bool, Optional[int]]:
-    """
-    Проверяет, может ли пользователь получить бонус.
-    Возвращает (можно ли получить, сколько секунд осталось до следующего бонуса)
-    """
+    """Проверяет, может ли пользователь получить бонус."""
     user_data = get_user(user_id)
     last_bonus = user_data.get('last_bonus_time')
     
@@ -118,7 +180,6 @@ def can_claim_bonus(user_id: int) -> tuple[bool, Optional[int]]:
     last_bonus_time = datetime.fromisoformat(last_bonus)
     time_diff = datetime.now() - last_bonus_time
     
-    # Бонус можно получать раз в 2 часа (7200 секунд)
     cooldown = 7200  # 2 часа в секундах
     elapsed = time_diff.total_seconds()
     
@@ -128,23 +189,121 @@ def can_claim_bonus(user_id: int) -> tuple[bool, Optional[int]]:
         remaining = int(cooldown - elapsed)
         return False, remaining
 
-# ==== FSM для админки (рассылка) ====
+# ==== Система чеков ====
+def generate_check_code() -> str:
+    """Генерирует уникальный код для чека."""
+    return str(uuid.uuid4())[:8].upper()
+
+def create_check(creator_id: int, amount: int, max_activations: int) -> dict:
+    """Создает новый чек."""
+    checks = load_checks()
+    check_code = generate_check_code()
+    
+    check_data = {
+        "code": check_code,
+        "creator_id": creator_id,
+        "amount": amount,
+        "max_activations": max_activations,
+        "current_activations": 0,
+        "created_at": datetime.now().isoformat(),
+        "expires_at": (datetime.now() + timedelta(days=7)).isoformat(),
+        "activated_by": [],
+        "active": True
+    }
+    
+    checks[check_code] = check_data
+    save_checks(checks)
+    
+    user_data = get_user(creator_id)
+    user_data['checks_created'] = user_data.get('checks_created', 0) + 1
+    update_user(creator_id, user_data)
+    
+    return check_data
+
+def activate_check_logic(check_code: str, user_id: int) -> dict:
+    """Активирует чек и возвращает результат (логика)."""
+    checks = load_checks()
+    
+    if check_code not in checks:
+        return {"success": False, "reason": "not_found"}
+    
+    check = checks[check_code]
+    
+    if not check.get('active', True):
+        return {"success": False, "reason": "inactive"}
+    
+    if check['current_activations'] >= check['max_activations']:
+        check['active'] = False
+        save_checks(checks)
+        return {"success": False, "reason": "expired"}
+    
+    if user_id in check['activated_by']:
+        return {"success": False, "reason": "already_activated"}
+    
+    expires_at = datetime.fromisoformat(check['expires_at'])
+    if datetime.now() > expires_at:
+        check['active'] = False
+        save_checks(checks)
+        return {"success": False, "reason": "expired"}
+    
+    check['current_activations'] += 1
+    check['activated_by'].append(user_id)
+    
+    if check['current_activations'] >= check['max_activations']:
+        check['active'] = False
+    
+    save_checks(checks)
+    
+    user_data = get_user(user_id)
+    user_data['balance'] += check['amount']
+    user_data['checks_activated'] = user_data.get('checks_activated', 0) + 1
+    update_user(user_id, user_data)
+    
+    return {
+        "success": True,
+        "amount": check['amount'],
+        "creator_id": check['creator_id'],
+        "remaining": check['max_activations'] - check['current_activations']
+    }
+
+def get_user_checks(user_id: int) -> list:
+    """Возвращает все чеки, созданные пользователем."""
+    checks = load_checks()
+    user_checks = []
+    for code, check in checks.items():
+        if check['creator_id'] == user_id:
+            user_checks.append(check)
+    return user_checks
+
+# ==== FSM для админки и чеков ====
 class AdminStates(StatesGroup):
-    waiting_for_broadcast = State()  # Ждем текст рассылки
-    waiting_for_user_id_balance = State()  # Ждем ID для изменения баланса
-    waiting_for_balance_amount = State()  # Ждем сумму изменения
-    waiting_for_user_id_reset = State()  # Ждем ID для сброса
+    waiting_for_broadcast = State()
+    waiting_for_broadcast_buttons = State()
+    waiting_for_user_id_balance = State()
+    waiting_for_balance_amount = State()
+    waiting_for_user_id_reset = State()
+
+class CheckStates(StatesGroup):
+    waiting_for_amount = State()
+    waiting_for_activations = State()
 
 # ==== Генерация клавиатур (Inline) ====
-def main_menu_keyboard():
-    """Главное меню (5 кнопок)."""
+def main_menu_keyboard(is_private: bool = True):
+    """Главное меню (в личке показываем все кнопки, в чатах - без чеков)."""
     builder = InlineKeyboardBuilder()
     builder.button(text="👤 Профиль", callback_data="profile")
     builder.button(text="🏆 Топ", callback_data="top")
     builder.button(text="❓ Помощь", callback_data="help")
     builder.button(text="💎 Донат", callback_data="donate")
     builder.button(text="📋 Команды", callback_data="commands")
-    builder.adjust(2, 2, 1)  # по 2, 2 и 1 кнопка в ряд
+    
+    # Кнопка "Чеки" только в личных сообщениях
+    if is_private:
+        builder.button(text="🧾 Чеки", callback_data="checks_menu")
+        builder.adjust(2, 2, 2)
+    else:
+        builder.adjust(2, 2, 1)
+    
     return builder.as_markup()
 
 def back_button_keyboard():
@@ -153,8 +312,26 @@ def back_button_keyboard():
     builder.button(text="🔙 Назад", callback_data="back_to_main")
     return builder.as_markup()
 
+def checks_menu_keyboard():
+    """Меню чеков."""
+    builder = InlineKeyboardBuilder()
+    builder.button(text="🎁 Создать чек", callback_data="check_create")
+    builder.button(text="📜 Мои чеки", callback_data="check_my")
+    builder.button(text="🔙 Назад", callback_data="back_to_main")
+    builder.adjust(2, 1)
+    return builder.as_markup()
+
+def check_keyboard(check_code: str):
+    """Клавиатура для чека."""
+    builder = InlineKeyboardBuilder()
+    builder.button(text="🎁 Активировать чек", callback_data=f"activate_check_{check_code}")
+    builder.button(text="📋 Копировать код", callback_data=f"copy_code_{check_code}")
+    builder.button(text="🔄 Поделиться", switch_inline_query=f"Чек {check_code}")
+    builder.adjust(1)
+    return builder.as_markup()
+
 def donate_keyboard():
-    """Клавиатура для доната (звезды)."""
+    """Клавиатура для доната."""
     builder = InlineKeyboardBuilder()
     builder.button(text="⭐ 15 звёзд", callback_data="donate_15")
     builder.button(text="⭐ 50 звёзд", callback_data="donate_50")
@@ -180,55 +357,191 @@ def claim_keyboard(claim_id: str):
 def commands_keyboard():
     """Клавиатура для раздела команд."""
     builder = InlineKeyboardBuilder()
-    builder.button(text="🍪 /bonus", callback_data="info_bonus")
+    builder.button(text="🎲 /bonus", callback_data="info_bonus")
     builder.button(text="👤 /start", callback_data="info_start")
+    builder.button(text="🏆 /top", callback_data="info_top")
+    builder.button(text="🧾 /check", callback_data="info_check")
     builder.button(text="🔙 Назад", callback_data="back_to_main")
-    builder.adjust(2, 1)
+    builder.adjust(2, 2, 1)
     return builder.as_markup()
+
+def broadcast_buttons_keyboard():
+    """Клавиатура для выбора типа кнопок в рассылке (БЕЗ ПРЕМИУМ ЭМОДЗИ)."""
+    builder = InlineKeyboardBuilder()
+    builder.button(text="🔗 Без кнопок", callback_data="broadcast_no_buttons")
+    builder.button(text="🔗 Одна кнопка", callback_data="broadcast_one_button")
+    builder.button(text="🔗 Две кнопки", callback_data="broadcast_two_buttons")
+    builder.button(text="🔗 Три кнопки", callback_data="broadcast_three_buttons")
+    builder.button(text="❌ Отмена", callback_data="broadcast_cancel")
+    builder.adjust(1)
+    return builder.as_markup()
+
+# ==== Получение информации о боте ====
+async def get_bot_info():
+    """Получает информацию о боте."""
+    bot_info = await bot.get_me()
+    return bot_info.username
 
 # ==== Команда /start ====
 @dp.message(CommandStart())
 async def command_start_handler(message: Message) -> None:
     """Обработчик команды /start."""
     user = message.from_user
+    is_private = message.chat.type == ChatType.PRIVATE
+    
     # Регистрируем пользователя или обновляем его username
     user_data = get_user(user.id)
     user_data['username'] = user.username or user.full_name
     update_user(user.id, user_data)
+    
+    # Получаем username бота
+    bot_username = (await bot.get_me()).username
 
-    # Красивое приветствие
+    # Разные приветствия для лички и чата
+    if is_private:
+        text = (
+            f"{premium_emoji('rocket')} <b>Приветик, {user.full_name}!</b>\n"
+            f"➖➖➖➖➖➖➖➖➖➖\n\n"
+            f"{premium_emoji('game')} <b>Я - бот для раздачи печенек</b> за активность в нашем "
+            f"<a href='{CHANNEL_LINK}'>Telegram канале</a>.\n\n"
+            f"{premium_emoji('prize')} <b>В конце каждого месяца</b> подводятся итоги, а топ-10 охотников "
+            f"получают крутые вознаграждения!\n\n"
+            f"{premium_emoji('rules')} <b>Основные возможности:</b>\n"
+            f"• {premium_emoji('dice')} <code>/bonus</code> — бонус раз в 2 часа (1-20 печенек)\n"
+            f"• {premium_emoji('check')} <code>/check</code> — создать чек на печеньки (только в личке)\n"
+            f"• {premium_emoji('win')} <code>/top</code> — топ пользователей\n\n"
+            f"➖➖➖➖➖➖➖➖➖➖\n"
+            f"{premium_emoji('lightning')} <b>Вперед на Охоту за Печеньками!</b>\n"
+            f"<blockquote>Покажи всем, кто здесь BOSS!</blockquote>"
+        )
+    else:
+        text = (
+            f"{premium_emoji('rocket')} <b>Привет, {user.full_name}!</b>\n"
+            f"➖➖➖➖➖➖➖➖➖➖\n\n"
+            f"{premium_emoji('game')} Я бот для раздачи печенек в этом чате!\n\n"
+            f"{premium_emoji('dice')} <code>/bonus</code> — получить бонус раз в 2 часа\n"
+            f"{premium_emoji('win')} <code>/top</code> — топ пользователей\n\n"
+            f"{premium_emoji('info')} Для создания чеков и управления профилем напиши мне в личку: @{bot_username}"
+        )
+
+    await message.answer(text, reply_markup=main_menu_keyboard(is_private), disable_web_page_preview=True)
+
+# ==== Команда /top ====
+@dp.message(Command("top"))
+async def top_command_handler(message: Message) -> None:
+    """Быстрый вывод топа пользователей."""
+    top_users = get_top_users(10)
+    user_id = message.from_user.id
+    user_balance = get_user(user_id).get('balance', 0)
+    user_place = get_user_place(user_id)
+    
     text = (
-        f"🥰 <b>Приветик, {user.full_name}!</b>\n\n"
+        f"{premium_emoji('win')} <b>ТОП ПОЛЬЗОВАТЕЛЕЙ</b>\n"
         f"➖➖➖➖➖➖➖➖➖➖\n\n"
-        f"🐾 <b>Я - бот для раздачи печенек</b> за активность в нашем "
-        f"<a href='{CHANNEL_LINK}'>Telegram чате</a>.\n\n"
-        f"🍪 <b>В конце каждого месяца</b> подводятся итоги, а топ-10 охотников "
-        f"получают крутые вознаграждения на нашем сервере!\n\n"
-        f"🎯 <b>Команды бота:</b>\n"
-        f"• <code>/bonus</code> — получить бонусные печеньки (раз в 2 часа)\n"
-        f"➖➖➖➖➖➖➖➖➖➖\n\n"
-        f"😎 <b>Вперед на Охоту за Печеньками!</b>\n"
-        f"<blockquote>Покажи всем, кто здесь BOSS!</blockquote>"
     )
+    
+    medals = ["🥇", "🥈", "🥉"]
+    for i, (uid_str, user_info) in enumerate(top_users):
+        uname = user_info.get('username', 'Неизвестно')
+        if uname and not uname.startswith('Неизвестно'):
+            display_name = f"@{uname}" if not uname.startswith('@') else uname
+        else:
+            display_name = f"ID {uid_str}"
+        
+        medal = medals[i] if i < 3 else f"{i+1}."
+        balance = user_info.get('balance', 0)
+        text += f"{medal} <b>{display_name}</b> — {premium_emoji('balance')} <code>{balance}</code>\n"
+    
+    text += (
+        f"\n➖➖➖➖➖➖➖➖➖➖\n"
+        f"{premium_emoji('user')} <b>Ваша позиция:</b> {user_place}\n"
+        f"{premium_emoji('balance')} <b>Ваш баланс:</b> <code>{user_balance}</code>\n"
+        f"➖➖➖➖➖➖➖➖➖➖"
+    )
+    
+    await message.answer(text, reply_markup=back_button_keyboard())
 
-    await message.answer(text, reply_markup=main_menu_keyboard(), disable_web_page_preview=True)
+# ==== Команда /check (только в личке) ====
+@dp.message(Command("check"))
+async def check_command_handler(message: Message, state: FSMContext) -> None:
+    """Создание чека через команду (только в личных сообщениях)."""
+    # Проверяем, что команда вызвана в личных сообщениях
+    if message.chat.type != ChatType.PRIVATE:
+        bot_username = (await bot.get_me()).username
+        await message.answer(
+            f"{premium_emoji('error')} <b>Команда недоступна в чатах</b>\n\n"
+            f"Создавать чеки можно только в личных сообщениях с ботом.\n"
+            f"Напишите мне в личку: @{bot_username}"
+        )
+        return
+    
+    args = message.text.split()
+    if len(args) == 3:
+        try:
+            amount = int(args[1])
+            activations = int(args[2])
+            await process_check_creation(message, amount, activations, state)
+        except ValueError:
+            await message.answer(
+                f"{premium_emoji('error')} <b>Неверный формат</b>\n\n"
+                f"Используйте: <code>/check сумма количество</code>\n"
+                f"Пример: <code>/check 100 5</code>"
+            )
+    else:
+        await message.answer(
+            f"{premium_emoji('check')} <b>СОЗДАНИЕ ЧЕКА</b>\n"
+            f"➖➖➖➖➖➖➖➖➖➖\n\n"
+            f"Введите сумму печенек для чека:",
+            reply_markup=back_button_keyboard()
+        )
+        await state.set_state(CheckStates.waiting_for_amount)
 
-# ==== Команда /bonus (только в групповом чате) ====
+async def process_check_creation(message: Message, amount: int, activations: int, state: FSMContext):
+    """Обработка создания чека."""
+    user_id = message.from_user.id
+    user_data = get_user(user_id)
+    
+    if user_data['balance'] < amount * activations:
+        await message.answer(
+            f"{premium_emoji('error')} <b>Недостаточно печенек!</b>\n\n"
+            f"Требуется: {amount * activations} 🍪\n"
+            f"У вас: {user_data['balance']} 🍪"
+        )
+        return
+    
+    user_data['balance'] -= amount * activations
+    update_user(user_id, user_data)
+    
+    check = create_check(user_id, amount, activations)
+    
+    text = (
+        f"{premium_emoji('prize')} <b>ЧЕК СОЗДАН!</b>\n"
+        f"➖➖➖➖➖➖➖➖➖➖\n\n"
+        f"{premium_emoji('balance')} <b>Сумма:</b> {amount} 🍪\n"
+        f"{premium_emoji('users')} <b>Активаций:</b> {activations}\n"
+        f"{premium_emoji('check')} <b>Код чека:</b> <code>{check['code']}</code>\n\n"
+        f"{premium_emoji('time')} <b>Действует до:</b> {check['expires_at'][:10]}\n\n"
+        f"<i>Поделитесь кодом или нажмите кнопку ниже</i>\n"
+        f"➖➖➖➖➖➖➖➖➖➖"
+    )
+    
+    await message.answer(text, reply_markup=check_keyboard(check['code']))
+    if state:
+        await state.clear()
+
+# ==== Команда /bonus ====
 @dp.message(Command("bonus"))
 async def bonus_command_handler(message: Message) -> None:
-    """Обработчик команды /bonus - выдача случайного бонуса раз в 2 часа."""
-    # Проверяем, что команда вызвана в нужном чате
+    """Обработчик команды /bonus."""
     if message.chat.id != GIVEAWAY_CHAT_ID:
-        return  # Игнорируем команду в других чатах
+        return
     
     user = message.from_user
     user_id = user.id
     
-    # Проверяем, можно ли получить бонус
     can_get, remaining = can_claim_bonus(user_id)
     
     if not can_get:
-        # Форматируем время ожидания
         hours = remaining // 3600
         minutes = (remaining % 3600) // 60
         seconds = remaining % 60
@@ -242,55 +555,39 @@ async def bonus_command_handler(message: Message) -> None:
             time_text += f"{seconds} сек."
         
         await message.reply(
-            f"⏳ <b>Бонус пока недоступен!</b>\n\n"
-            f"🍪 Ты уже получал бонус недавно.\n"
-            f"📅 Следующий бонус будет доступен через: <b>{time_text}</b>\n\n"
-            f"<i>Возвращайся позже и забирай свою печеньку!</i>"
+            f"{premium_emoji('time')} <b>Бонус пока недоступен!</b>\n\n"
+            f"{premium_emoji('prize')} Следующий бонус через: <b>{time_text}</b>\n\n"
+            f"<i>Возвращайся позже!</i>"
         )
         return
     
-    # Генерируем случайное количество печенек от 1 до 20
     bonus_amount = random.randint(1, 20)
-    
-    # Обновляем баланс и время последнего бонуса
     user_data = get_user(user_id)
     current_balance = user_data.get('balance', 0)
     new_balance = current_balance + bonus_amount
     
     user_data['balance'] = new_balance
     user_data['last_bonus_time'] = datetime.now().isoformat()
+    user_data['total_earned'] = user_data.get('total_earned', 0) + bonus_amount
     update_user(user_id, user_data)
     
-    # Отправляем сообщение о получении бонуса
     await message.reply(
-        f"🎉 <b>БОНУС ПОЛУЧЕН!</b>\n\n"
-        f"🍪 Ты получил: <b>{bonus_amount} печенек</b>\n"
-        f"💰 Текущий баланс: <b>{new_balance} 🍪</b>\n\n"
-        f"📅 Следующий бонус будет доступен через 2 часа.\n"
-        f"<blockquote>Не забывай заходить за новыми печеньками!</blockquote>"
+        f"{premium_emoji('prize')} <b>БОНУС ПОЛУЧЕН!</b>\n"
+        f"➖➖➖➖➖➖➖➖➖➖\n\n"
+        f"{premium_emoji('dice')} Ты получил: <b>{bonus_amount} печенек</b>\n"
+        f"{premium_emoji('balance')} Текущий баланс: <b>{new_balance} 🍪</b>\n\n"
+        f"{premium_emoji('time')} Следующий бонус через 2 часа\n"
+        f"➖➖➖➖➖➖➖➖➖➖"
     )
-    
-    # Уведомляем админов о получении бонуса
-    for admin_id in ADMIN_IDS:
-        try:
-            await bot.send_message(
-                admin_id,
-                f"🎁 <b>Бонус получен!</b>\n\n"
-                f"👤 Пользователь: {user.full_name}\n"
-                f"🆔 ID: <code>{user_id}</code>\n"
-                f"🍪 Получил: {bonus_amount} печенек\n"
-                f"💰 Текущий баланс: {new_balance} 🍪"
-            )
-        except:
-            pass
 
-# ==== Обработчики Inline кнопок (Callback) ====
+# ==== Обработчики Inline кнопок ====
 @dp.callback_query(F.data == "back_to_main")
 async def back_to_main(callback: CallbackQuery):
     """Возврат в главное меню."""
+    is_private = callback.message.chat.type == ChatType.PRIVATE
     await callback.message.edit_text(
-        text="🥰 <b>Главное меню</b>\n\n<i>Выбери нужный раздел:</i>",
-        reply_markup=main_menu_keyboard()
+        text=f"{premium_emoji('rocket')} <b>Главное меню</b>\n\n<i>Выбери нужный раздел:</i>",
+        reply_markup=main_menu_keyboard(is_private)
     )
     await callback.answer()
 
@@ -301,19 +598,25 @@ async def show_profile(callback: CallbackQuery):
     user = callback.from_user
     user_data = get_user(user.id)
 
-    # Дата регистрации
     reg_date = datetime.fromisoformat(user_data['registered_at']).strftime("%d.%m.%Y %H:%M")
     balance = user_data.get('balance', 0)
     place = get_user_place(user.id)
+    total_earned = user_data.get('total_earned', 0)
+    checks_created = user_data.get('checks_created', 0)
+    checks_activated = user_data.get('checks_activated', 0)
 
     text = (
-        f"⭐ <b>ПРОФИЛЬ ПОЛЬЗОВАТЕЛЯ</b>\n"
+        f"{premium_emoji('user')} <b>ПРОФИЛЬ ПОЛЬЗОВАТЕЛЯ</b>\n"
         f"➖➖➖➖➖➖➖➖➖➖\n\n"
-        f"👤 <b>Никнейм:</b> {user.full_name}\n"
-        f"📱 <b>ID:</b> <code>{user.id}</code>\n"
-        f"🗓 <b>Регистрация:</b> {reg_date}\n\n"
-        f"💰 <b>В твоем мешке:</b> <code>{balance} 🍪</code>\n"
-        f"📊 <b>Позиция в топе:</b> <code>{place} место</code>\n"
+        f"{premium_emoji('user')} <b>Никнейм:</b> {user.full_name}\n"
+        f"{premium_emoji('min')} <b>ID:</b> <code>{user.id}</code>\n"
+        f"{premium_emoji('time')} <b>Регистрация:</b> {reg_date}\n\n"
+        f"{premium_emoji('balance')} <b>Текущий баланс:</b> <code>{balance} 🍪</code>\n"
+        f"{premium_emoji('stats')} <b>Всего заработано:</b> <code>{total_earned} 🍪</code>\n"
+        f"{premium_emoji('win')} <b>Позиция в топе:</b> <code>{place}</code>\n\n"
+        f"{premium_emoji('check')} <b>Статистика чеков:</b>\n"
+        f"• Создано: {checks_created}\n"
+        f"• Активировано: {checks_activated}\n"
         f"➖➖➖➖➖➖➖➖➖➖"
     )
 
@@ -325,32 +628,30 @@ async def show_profile(callback: CallbackQuery):
 async def show_top(callback: CallbackQuery):
     """Показывает топ пользователей."""
     user = callback.from_user
-    top_users = get_top_users(5)  # Берем топ-5
+    top_users = get_top_users(10)
     balance = get_user(user.id).get('balance', 0)
     place = get_user_place(user.id)
 
     text = (
-        f"🏆 <b>ТОП ОХОТНИКОВ ЗА ПЕЧЕНЬЕМ</b>\n"
+        f"{premium_emoji('win')} <b>ТОП ОХОТНИКОВ ЗА ПЕЧЕНЬЕМ</b>\n"
         f"<i>(самые крутые ребята)</i>\n"
         f"➖➖➖➖➖➖➖➖➖➖\n\n"
     )
 
-    medals = ["🥇", "🥈", "🥉", "🏅", "🏅"]
+    medals = ["🥇", "🥈", "🥉", "🏅", "🏅", "🏅", "🏅", "🏅", "🏅", "🏅"]
     for i, (user_id_str, user_info) in enumerate(top_users):
-        # Пытаемся получить имя пользователя
         uname = user_info.get('username', 'Неизвестно')
-        # Если это username (без @), то делаем ссылку
         if uname and not uname.startswith('Неизвестно'):
             display_name = f"@{uname}" if not uname.startswith('@') else uname
         else:
             display_name = f"ID {user_id_str}"
 
-        text += f"{medals[i]} <b>{i+1} место:</b> {display_name} — <code>{user_info.get('balance', 0)} 🍪</code>\n"
+        text += f"{medals[i]} <b>{i+1}.</b> {display_name} — {premium_emoji('balance')} <code>{user_info.get('balance', 0)}</code>\n"
 
     text += (
         f"\n➖➖➖➖➖➖➖➖➖➖\n"
-        f"💰 <b>В твоем мешке:</b> <code>{balance} 🍪</code>\n"
-        f"📊 <b>Твоя позиция:</b> <code>{place} место</code>\n"
+        f"{premium_emoji('user')} <b>Ваша позиция:</b> {place}\n"
+        f"{premium_emoji('balance')} <b>Ваш баланс:</b> <code>{balance}</code>\n"
         f"➖➖➖➖➖➖➖➖➖➖"
     )
 
@@ -361,21 +662,41 @@ async def show_top(callback: CallbackQuery):
 @dp.callback_query(F.data == "help")
 async def show_help(callback: CallbackQuery):
     """Показывает раздел помощи."""
-    text = (
-        f"❓ <b>РАЗДЕЛ ПОМОЩИ</b>\n"
-        f"➖➖➖➖➖➖➖➖➖➖\n\n"
-        f"<b>Как получать печеньки?</b>\n"
-        f"🍪 Печеньки выдаются каждый час в нашем канале.\n"
-        f"• Жми кнопку <b>'Забрать печеньку!'</b>\n"
-        f"• Будь первым — получи +5 печенек!\n\n"
-        f"🎁 <b>Бонусная система:</b>\n"
-        f"• Введи команду <code>/bonus</code> в чате\n"
-        f"• Получай от 1 до 20 печенек раз в 2 часа\n\n"
-        f"📊 <b>Топ пользователей:</b>\n"
-        f"• В конце месяца топ-10 получают награды\n"
-        f"• Следи за своим рейтингом в разделе 'Топ'\n"
-        f"➖➖➖➖➖➖➖➖➖➖"
-    )
+    is_private = callback.message.chat.type == ChatType.PRIVATE
+    bot_username = (await bot.get_me()).username
+    
+    if is_private:
+        text = (
+            f"{premium_emoji('info')} <b>РАЗДЕЛ ПОМОЩИ</b>\n"
+            f"➖➖➖➖➖➖➖➖➖➖\n\n"
+            f"{premium_emoji('prize')} <b>Как получать печеньки?</b>\n"
+            f"• Ежечасные раздачи в чате с кнопкой\n"
+            f"• Команда <code>/bonus</code> раз в 2 часа\n"
+            f"• Активация чеков от других пользователей\n\n"
+            f"{premium_emoji('check')} <b>Система чеков:</b>\n"
+            f"• Создавай чеки на печеньки (только в личке)\n"
+            f"• Делись с друзьями\n"
+            f"• Указывай количество активаций\n\n"
+            f"{premium_emoji('win')} <b>Топ пользователей:</b>\n"
+            f"• В конце месяца топ-10 получают награды\n"
+            f"• Следи за рейтингом в разделе 'Топ'\n"
+            f"➖➖➖➖➖➖➖➖➖➖"
+        )
+    else:
+        text = (
+            f"{premium_emoji('info')} <b>РАЗДЕЛ ПОМОЩИ</b>\n"
+            f"➖➖➖➖➖➖➖➖➖➖\n\n"
+            f"{premium_emoji('prize')} <b>Как получать печеньки?</b>\n"
+            f"• Ежечасные раздачи с кнопкой\n"
+            f"• Команда <code>/bonus</code> раз в 2 часа\n\n"
+            f"{premium_emoji('check')} <b>Чеки:</b>\n"
+            f"• Активируй чеки от других\n"
+            f"• Для создания чеков напиши в личку: @{bot_username}\n\n"
+            f"{premium_emoji('win')} <b>Топ пользователей:</b>\n"
+            f"• В конце месяца топ-10 получают награды\n"
+            f"➖➖➖➖➖➖➖➖➖➖"
+        )
+    
     await callback.message.edit_text(text, reply_markup=support_keyboard())
     await callback.answer()
 
@@ -383,36 +704,51 @@ async def show_help(callback: CallbackQuery):
 @dp.callback_query(F.data == "commands")
 async def show_commands(callback: CallbackQuery):
     """Показывает раздел с командами."""
-    text = (
-        f"📋 <b>ДОСТУПНЫЕ КОМАНДЫ</b>\n"
-        f"➖➖➖➖➖➖➖➖➖➖\n\n"
-        f"<b>👤 Основные команды:</b>\n"
-        f"• <code>/start</code> — запуск бота и главное меню\n"
-        f"• <code>/bonus</code> — получить бонус (раз в 2 часа, только в чате)\n\n"
-        f"<b>💡 Как использовать /bonus:</b>\n"
-        f"• Команда работает только в чате канала\n"
-        f"• Дает от 1 до 20 печенек случайно\n"
-        f"• Доступна раз в 2 часа для каждого\n"
-        f"➖➖➖➖➖➖➖➖➖➖"
-    )
+    is_private = callback.message.chat.type == ChatType.PRIVATE
+    bot_username = (await bot.get_me()).username
+    
+    if is_private:
+        text = (
+            f"{premium_emoji('rules')} <b>ДОСТУПНЫЕ КОМАНДЫ</b>\n"
+            f"➖➖➖➖➖➖➖➖➖➖\n\n"
+            f"<b>👤 Основные команды:</b>\n"
+            f"• <code>/start</code> — запуск бота и главное меню\n"
+            f"• <code>/bonus</code> — получить бонус (раз в 2 часа, только в чате)\n"
+            f"• <code>/top</code> — топ пользователей\n"
+            f"• <code>/check</code> — создать чек на печеньки\n\n"
+            f"{premium_emoji('check')} <b>Как создать чек:</b>\n"
+            f"• <code>/check 100 5</code> — чек на 100 печенек, 5 активаций\n"
+            f"➖➖➖➖➖➖➖➖➖➖"
+        )
+    else:
+        text = (
+            f"{premium_emoji('rules')} <b>ДОСТУПНЫЕ КОМАНДЫ</b>\n"
+            f"➖➖➖➖➖➖➖➖➖➖\n\n"
+            f"<b>👤 Команды в чате:</b>\n"
+            f"• <code>/bonus</code> — получить бонус (раз в 2 часа)\n"
+            f"• <code>/top</code> — топ пользователей\n\n"
+            f"{premium_emoji('check')} <b>Для создания чеков</b> напишите мне в личку: @{bot_username}\n"
+            f"➖➖➖➖➖➖➖➖➖➖"
+        )
+    
     await callback.message.edit_text(text, reply_markup=commands_keyboard())
     await callback.answer()
 
+# ---- Информация о командах ----
 @dp.callback_query(F.data == "info_bonus")
 async def info_bonus(callback: CallbackQuery):
-    """Подробная информация о команде /bonus."""
+    """Информация о команде /bonus."""
     text = (
-        f"🍪 <b>КОМАНДА /bonus</b>\n"
+        f"{premium_emoji('dice')} <b>КОМАНДА /bonus</b>\n"
         f"➖➖➖➖➖➖➖➖➖➖\n\n"
         f"<b>📌 Описание:</b>\n"
-        f"Команда для получения бонусных печенек в чате канала.\n\n"
+        f"Бонусные печеньки в чате канала\n\n"
         f"<b>⚙️ Параметры:</b>\n"
-        f"• 🎲 <b>Количество:</b> от 1 до 20 печенек (случайно)\n"
-        f"• ⏰ <b>Перезарядка:</b> 2 часа\n"
-        f"• 📍 <b>Где работает:</b> только в чате канала\n\n"
-        f"<b>💬 Пример использования:</b>\n"
-        f"<code>/bonus</code> — ввести в чате канала\n\n"
-        f"<blockquote>Не забывай заходить каждые 2 часа за новой порцией печенек!</blockquote>\n"
+        f"• {premium_emoji('dice')} <b>Количество:</b> 1-20 печенек\n"
+        f"• {premium_emoji('time')} <b>Перезарядка:</b> 2 часа\n"
+        f"• {premium_emoji('min')} <b>Где работает:</b> только в чате\n\n"
+        f"<b>💬 Пример:</b> <code>/bonus</code>\n\n"
+        f"<blockquote>Заходи каждые 2 часа!</blockquote>\n"
         f"➖➖➖➖➖➖➖➖➖➖"
     )
     await callback.message.edit_text(text, reply_markup=commands_keyboard())
@@ -420,34 +756,380 @@ async def info_bonus(callback: CallbackQuery):
 
 @dp.callback_query(F.data == "info_start")
 async def info_start(callback: CallbackQuery):
-    """Подробная информация о команде /start."""
+    """Информация о команде /start."""
     text = (
-        f"👤 <b>КОМАНДА /start</b>\n"
+        f"{premium_emoji('user')} <b>КОМАНДА /start</b>\n"
         f"➖➖➖➖➖➖➖➖➖➖\n\n"
         f"<b>📌 Описание:</b>\n"
-        f"Основная команда для запуска бота и регистрации пользователя.\n\n"
+        f"Запуск бота и регистрация\n\n"
         f"<b>⚙️ Что делает:</b>\n"
-        f"• ✅ Регистрирует тебя в системе\n"
-        f"• 📊 Показывает главное меню\n"
-        f"• 👤 Обновляет твой профиль\n\n"
-        f"<b>💬 Пример использования:</b>\n"
-        f"<code>/start</code> — ввести в личных сообщениях с ботом\n\n"
-        f"<blockquote>После /start ты можешь пользоваться всеми функциями бота!</blockquote>\n"
+        f"• ✅ Регистрирует в системе\n"
+        f"• 📊 Показывает меню\n"
+        f"• 👤 Обновляет профиль\n\n"
+        f"<b>💬 Пример:</b> <code>/start</code>\n"
         f"➖➖➖➖➖➖➖➖➖➖"
     )
     await callback.message.edit_text(text, reply_markup=commands_keyboard())
     await callback.answer()
+
+@dp.callback_query(F.data == "info_top")
+async def info_top(callback: CallbackQuery):
+    """Информация о команде /top."""
+    text = (
+        f"{premium_emoji('win')} <b>КОМАНДА /top</b>\n"
+        f"➖➖➖➖➖➖➖➖➖➖\n\n"
+        f"<b>📌 Описание:</b>\n"
+        f"Показывает топ пользователей\n\n"
+        f"<b>⚙️ Особенности:</b>\n"
+        f"• Топ-10 по балансу\n"
+        f"• Работает везде\n"
+        f"• Показывает вашу позицию\n\n"
+        f"<b>💬 Пример:</b> <code>/top</code>\n"
+        f"➖➖➖➖➖➖➖➖➖➖"
+    )
+    await callback.message.edit_text(text, reply_markup=commands_keyboard())
+    await callback.answer()
+
+@dp.callback_query(F.data == "info_check")
+async def info_check(callback: CallbackQuery):
+    """Информация о команде /check."""
+    text = (
+        f"{premium_emoji('check')} <b>КОМАНДА /check</b>\n"
+        f"➖➖➖➖➖➖➖➖➖➖\n\n"
+        f"<b>📌 Описание:</b>\n"
+        f"Создание чеков на печеньки (только в личке)\n\n"
+        f"<b>⚙️ Формат:</b>\n"
+        f"<code>/check [сумма] [активации]</code>\n\n"
+        f"<b>💬 Примеры:</b>\n"
+        f"• <code>/check 100 5</code> — 5 активаций по 100 🍪\n"
+        f"• <code>/check 50 1</code> — 1 активация на 50 🍪\n\n"
+        f"<blockquote>Чек действует 7 дней</blockquote>\n"
+        f"➖➖➖➖➖➖➖➖➖➖"
+    )
+    await callback.message.edit_text(text, reply_markup=commands_keyboard())
+    await callback.answer()
+
+# ---- Меню чеков (только в личке) ----
+@dp.callback_query(F.data == "checks_menu")
+async def checks_menu(callback: CallbackQuery):
+    """Меню чеков (только в личных сообщениях)."""
+    # Проверяем, что вызов из личных сообщений
+    if callback.message.chat.type != ChatType.PRIVATE:
+        await callback.answer("❌ Меню чеков доступно только в личных сообщениях", show_alert=True)
+        return
+    
+    text = (
+        f"{premium_emoji('check')} <b>СИСТЕМА ЧЕКОВ</b>\n"
+        f"➖➖➖➖➖➖➖➖➖➖\n\n"
+        f"{premium_emoji('prize')} Создавай чеки на печеньки и делись с друзьями!\n"
+        f"{premium_emoji('users')} Каждый чек можно активировать несколько раз\n\n"
+        f"<b>Выбери действие:</b>\n"
+        f"➖➖➖➖➖➖➖➖➖➖"
+    )
+    await callback.message.edit_text(text, reply_markup=checks_menu_keyboard())
+    await callback.answer()
+
+@dp.callback_query(F.data == "check_create")
+async def check_create_start(callback: CallbackQuery, state: FSMContext):
+    """Начало создания чека (только в личке)."""
+    if callback.message.chat.type != ChatType.PRIVATE:
+        await callback.answer("❌ Создание чеков доступно только в личных сообщениях", show_alert=True)
+        return
+    
+    await callback.message.edit_text(
+        f"{premium_emoji('check')} <b>СОЗДАНИЕ ЧЕКА</b>\n"
+        f"➖➖➖➖➖➖➖➖➖➖\n\n"
+        f"Введите сумму печенек для чека:",
+        reply_markup=back_button_keyboard()
+    )
+    await state.set_state(CheckStates.waiting_for_amount)
+    await callback.answer()
+
+@dp.message(CheckStates.waiting_for_amount)
+async def process_check_amount(message: Message, state: FSMContext):
+    """Обработка суммы чека."""
+    if message.chat.type != ChatType.PRIVATE:
+        await state.clear()
+        return
+    
+    try:
+        amount = int(message.text.strip())
+        if amount < 1:
+            await message.answer(
+                f"{premium_emoji('error')} <b>Ошибка</b>\n\nСумма должна быть больше 0!"
+            )
+            return
+        if amount > 1000000:
+            await message.answer(
+                f"{premium_emoji('error')} <b>Ошибка</b>\n\nСлишком большая сумма!"
+            )
+            return
+        
+        await state.update_data(check_amount=amount)
+        await message.answer(
+            f"{premium_emoji('check')} <b>СОЗДАНИЕ ЧЕКА</b>\n"
+            f"➖➖➖➖➖➖➖➖➖➖\n\n"
+            f"Сумма: <b>{amount} 🍪</b>\n\n"
+            f"Введите количество активаций:",
+            reply_markup=back_button_keyboard()
+        )
+        await state.set_state(CheckStates.waiting_for_activations)
+    except ValueError:
+        await message.answer(
+            f"{premium_emoji('error')} <b>Ошибка</b>\n\nВведите число!"
+        )
+
+@dp.message(CheckStates.waiting_for_activations)
+async def process_check_activations(message: Message, state: FSMContext):
+    """Обработка количества активаций."""
+    if message.chat.type != ChatType.PRIVATE:
+        await state.clear()
+        return
+    
+    try:
+        activations = int(message.text.strip())
+        if activations < 1:
+            await message.answer(
+                f"{premium_emoji('error')} <b>Ошибка</b>\n\nКоличество активаций должно быть больше 0!"
+            )
+            return
+        if activations > 100:
+            await message.answer(
+                f"{premium_emoji('error')} <b>Ошибка</b>\n\nМаксимум 100 активаций!"
+            )
+            return
+        
+        data = await state.get_data()
+        amount = data['check_amount']
+        user_id = message.from_user.id
+        
+        user_data = get_user(user_id)
+        if user_data['balance'] < amount * activations:
+            await message.answer(
+                f"{premium_emoji('error')} <b>Недостаточно печенек!</b>\n\n"
+                f"Требуется: {amount * activations} 🍪\n"
+                f"У вас: {user_data['balance']} 🍪"
+            )
+            await state.clear()
+            return
+        
+        user_data['balance'] -= amount * activations
+        update_user(user_id, user_data)
+        
+        check = create_check(user_id, amount, activations)
+        
+        text = (
+            f"{premium_emoji('prize')} <b>ЧЕК СОЗДАН!</b>\n"
+            f"➖➖➖➖➖➖➖➖➖➖\n\n"
+            f"{premium_emoji('balance')} <b>Сумма:</b> {amount} 🍪\n"
+            f"{premium_emoji('users')} <b>Активаций:</b> {activations}\n"
+            f"{premium_emoji('check')} <b>Код чека:</b> <code>{check['code']}</code>\n\n"
+            f"{premium_emoji('time')} <b>Действует до:</b> {check['expires_at'][:10]}\n\n"
+            f"<i>Поделитесь кодом или нажмите кнопку ниже</i>\n"
+            f"➖➖➖➖➖➖➖➖➖➖"
+        )
+        
+        await message.answer(text, reply_markup=check_keyboard(check['code']))
+        await state.clear()
+        
+    except ValueError:
+        await message.answer(
+            f"{premium_emoji('error')} <b>Ошибка</b>\n\nВведите число!"
+        )
+
+@dp.callback_query(F.data == "check_my")
+async def show_my_checks(callback: CallbackQuery):
+    """Показывает чеки пользователя."""
+    if callback.message.chat.type != ChatType.PRIVATE:
+        await callback.answer("❌ Эта функция доступна только в личных сообщениях", show_alert=True)
+        return
+    
+    user_id = callback.from_user.id
+    checks = get_user_checks(user_id)
+    
+    if not checks:
+        await callback.message.edit_text(
+            f"{premium_emoji('info')} <b>У вас нет созданных чеков</b>\n\n"
+            f"Создайте первый чек в меню!",
+            reply_markup=checks_menu_keyboard()
+        )
+        await callback.answer()
+        return
+    
+    text = f"{premium_emoji('check')} <b>ВАШИ ЧЕКИ</b>\n➖➖➖➖➖➖➖➖➖➖\n\n"
+    
+    for check in checks[:5]:
+        status = "✅ Активен" if check['active'] else "❌ Неактивен"
+        text += (
+            f"<b>Код:</b> <code>{check['code']}</code>\n"
+            f"{premium_emoji('balance')} Сумма: {check['amount']} 🍪\n"
+            f"{premium_emoji('users')} Активации: {check['current_activations']}/{check['max_activations']}\n"
+            f"Статус: {status}\n"
+            f"➖➖➖➖➖➖➖➖➖➖\n"
+        )
+    
+    await callback.message.edit_text(text, reply_markup=checks_menu_keyboard())
+    await callback.answer()
+
+# ==== Система чеков - ОБРАБОТКА ТЕКСТОВЫХ СООБЩЕНИЙ ====
+@dp.callback_query(F.data.startswith("copy_code_"))
+async def copy_code_callback(callback: CallbackQuery):
+    """Обработчик кнопки копирования кода."""
+    check_code = callback.data.replace("copy_code_", "")
+    await callback.answer(
+        f"✅ Код скопирован: {check_code}",
+        show_alert=False
+    )
+
+@dp.message(F.text.regexp(r'^[A-F0-9]{8}$').as_("check_code"))
+async def process_check_code_message(message: Message, check_code: str):
+    """Обрабатывает сообщения, которые являются кодом чека."""
+    user_id = message.from_user.id
+    
+    # Проверяем существование чека
+    checks = load_checks()
+    if check_code not in checks:
+        await message.reply(
+            f"{premium_emoji('error')} <b>Чек не найден!</b>\n\n"
+            f"Код <code>{check_code}</code> не существует или был удален."
+        )
+        return
+    
+    check = checks[check_code]
+    
+    # Проверяем статус чека
+    if not check.get('active', True):
+        await message.reply(
+            f"{premium_emoji('error')} <b>Чек уже неактивен!</b>\n\n"
+            f"Этот чек больше нельзя активировать."
+        )
+        return
+    
+    if check['current_activations'] >= check['max_activations']:
+        await message.reply(
+            f"{premium_emoji('error')} <b>Чек использован!</b>\n\n"
+            f"Все активации этого чека уже использованы."
+        )
+        return
+    
+    expires_at = datetime.fromisoformat(check['expires_at'])
+    if datetime.now() > expires_at:
+        await message.reply(
+            f"{premium_emoji('error')} <b>Срок действия чека истек!</b>\n\n"
+            f"Чек действовал до {expires_at.strftime('%d.%m.%Y')}"
+        )
+        return
+    
+    # Если пользователь уже активировал этот чек
+    if user_id in check['activated_by']:
+        await message.reply(
+            f"{premium_emoji('warning')} <b>Вы уже активировали этот чек!</b>\n\n"
+            f"Каждый чек можно активировать только один раз."
+        )
+        return
+    
+    # Показываем информацию о чеке с кнопкой активации
+    text = (
+        f"{premium_emoji('check')} <b>ЧЕК НАЙДЕН!</b>\n"
+        f"➖➖➖➖➖➖➖➖➖➖\n\n"
+        f"<b>Код чека:</b> <code>{check_code}</code>\n"
+        f"{premium_emoji('balance')} <b>Сумма:</b> {check['amount']} 🍪\n"
+        f"{premium_emoji('users')} <b>Доступно активаций:</b> {check['max_activations'] - check['current_activations']}\n"
+        f"{premium_emoji('time')} <b>Действует до:</b> {check['expires_at'][:10]}\n\n"
+        f"<i>Нажмите кнопку ниже, чтобы активировать чек</i>\n"
+        f"➖➖➖➖➖➖➖➖➖➖"
+    )
+    
+    await message.reply(text, reply_markup=check_keyboard(check_code))
+
+@dp.message(F.text.lower().contains("чек"))
+async def process_check_mention(message: Message):
+    """Обрабатывает сообщения, содержащие слово 'чек' и код."""
+    text = message.text.upper()
+    # Ищем код чека (8 символов: буквы A-F и цифры)
+    match = re.search(r'[A-F0-9]{8}', text)
+    if match:
+        check_code = match.group()
+        # Имитируем вызов обработчика кода
+        await process_check_code_message(message, check_code)
+
+@dp.callback_query(F.data.startswith("activate_check_"))
+async def activate_check_callback(callback: CallbackQuery):
+    """Активация чека."""
+    check_code = callback.data.replace("activate_check_", "")
+    user_id = callback.from_user.id
+    
+    result = activate_check_logic(check_code, user_id)
+    
+    if result["success"]:
+        await callback.message.edit_text(
+            f"{premium_emoji('prize')} <b>ЧЕК АКТИВИРОВАН!</b>\n"
+            f"➖➖➖➖➖➖➖➖➖➖\n\n"
+            f"{premium_emoji('balance')} <b>Получено:</b> {result['amount']} 🍪\n"
+            f"{premium_emoji('users')} <b>Осталось активаций:</b> {result['remaining']}\n"
+            f"➖➖➖➖➖➖➖➖➖➖",
+            reply_markup=back_button_keyboard()
+        )
+        await callback.answer(f"✅ +{result['amount']} печенек!", show_alert=True)
+    else:
+        reasons = {
+            "not_found": "Чек не найден",
+            "inactive": "Чек неактивен",
+            "expired": "Срок действия чека истек",
+            "already_activated": "Вы уже активировали этот чек"
+        }
+        reason = reasons.get(result["reason"], "Ошибка активации")
+        await callback.answer(f"❌ {reason}", show_alert=True)
+
+# ==== Inline режим для быстрого шаринга чеков ====
+@dp.inline_query()
+async def inline_query_handler(inline_query: types.InlineQuery):
+    """Обработка inline запросов."""
+    query = inline_query.query.lower()
+    
+    if not query.startswith("чек"):
+        return
+    
+    # Парсим запрос вида "чек 100 5" или "чек ABC123"
+    parts = query.split()
+    if len(parts) < 2:
+        return
+    
+    if len(parts[1]) == 8 and all(c in 'ABCDEF0123456789' for c in parts[1].upper()):
+        # Это код чека
+        check_code = parts[1].upper()
+        checks = load_checks()
+        
+        if check_code in checks:
+            check = checks[check_code]
+            result = InlineQueryResultArticle(
+                id=check_code,
+                title=f"Чек {check_code}",
+                description=f"{check['amount']} 🍪, осталось {check['max_activations'] - check['current_activations']} активаций",
+                input_message_content=InputTextMessageContent(
+                    message_text=(
+                        f"{premium_emoji('check')} <b>ЧЕК НА ПЕЧЕНЬКИ</b>\n"
+                        f"➖➖➖➖➖➖➖➖➖➖\n\n"
+                        f"<b>Код:</b> <code>{check_code}</code>\n"
+                        f"{premium_emoji('balance')} <b>Сумма:</b> {check['amount']} 🍪\n"
+                        f"{premium_emoji('users')} <b>Осталось:</b> {check['max_activations'] - check['current_activations']}\n\n"
+                        f"<i>Отправь этот код другу или нажми кнопку!</i>"
+                    ),
+                    parse_mode=ParseMode.HTML
+                ),
+                reply_markup=check_keyboard(check_code)
+            )
+            await inline_query.answer([result], cache_time=1)
 
 # ---- Донат ----
 @dp.callback_query(F.data == "donate")
 async def show_donate(callback: CallbackQuery):
     """Показывает раздел доната."""
     text = (
-        f"💎 <b>ПОДДЕРЖКА ПРОЕКТА</b>\n"
+        f"{premium_emoji('dollar')} <b>ПОДДЕРЖКА ПРОЕКТА</b>\n"
         f"➖➖➖➖➖➖➖➖➖➖\n\n"
-        f"❤️ Если тебе понравился бот и ты хочешь поддержать его развитие, "
-        f"можешь сделать добровольное пожертвование.\n\n"
-        f"🙃 <b>Выбери желаемую сумму:</b>\n"
+        f"❤️ Если хочешь поддержать развитие бота,\n"
+        f"выбери сумму пожертвования:\n"
         f"➖➖➖➖➖➖➖➖➖➖"
     )
     await callback.message.edit_text(text, reply_markup=donate_keyboard())
@@ -458,40 +1140,37 @@ async def process_donate(callback: CallbackQuery):
     """Обработка выбора суммы доната."""
     amount = callback.data.split("_")[1]
     await callback.message.edit_text(
-        f"💎 <b>ПОДДЕРЖКА ПРОЕКТА</b>\n"
+        f"{premium_emoji('dollar')} <b>ПОДДЕРЖКА ПРОЕКТА</b>\n"
         f"➖➖➖➖➖➖➖➖➖➖\n\n"
         f"✅ Выбрано: <b>{amount} звёзд</b>\n\n"
-        f"📤 Отправьте подарок на пользователя: <code>@Dev_pranik</code>\n\n"
-        f"<i>После отправки звезд напишите в поддержку для подтверждения и получения бонусов!</i>\n"
+        f"{premium_emoji('user')} Отправьте подарок на: <code>@Dev_pranik</code>\n\n"
+        f"<i>После отправки напишите в поддержку</i>\n"
         f"➖➖➖➖➖➖➖➖➖➖",
         reply_markup=back_button_keyboard()
     )
     await callback.answer()
 
-# ==== Система раздачи печенек (по расписанию) ====
-# Хранилище активных раздач: {claim_id: claimed_user_id}
+# ==== Система раздачи печенек ====
 active_claims = {}
 
 def generate_claim_id() -> str:
     """Генерирует уникальный ID для раздачи."""
-    import time
     return str(int(time.time()))
 
 async def send_cookie_giveaway():
-    """Отправляет сообщение о раздаче печенек в указанный чат."""
+    """Отправляет сообщение о раздаче печенек."""
     claim_id = generate_claim_id()
-    active_claims[claim_id] = None  # Пока никто не забрал
+    active_claims[claim_id] = None
 
     text = (
-        f"🍪 <b>РАЗДАЧА ПЕЧЕНЬЕК!</b>\n"
+        f"{premium_emoji('prize')} <b>РАЗДАЧА ПЕЧЕНЬЕК!</b>\n"
         f"➖➖➖➖➖➖➖➖➖➖\n\n"
-        f"🔥 <b>Кто первый нажмёт кнопку</b> — тот получит +5 печенек!\n\n"
-        f"⚡️ <i>Торопись, удача любит смелых!</i>\n"
+        f"{premium_emoji('lightning')} <b>Кто первый нажмёт кнопку</b> — получит +5 печенек!\n\n"
+        f"{premium_emoji('dice')} <i>Торопись, удача любит смелых!</i>\n"
         f"➖➖➖➖➖➖➖➖➖➖"
     )
 
     try:
-        # Отправляем раздачу в указанный чат
         await bot.send_message(
             GIVEAWAY_CHAT_ID,
             text,
@@ -499,28 +1178,17 @@ async def send_cookie_giveaway():
         )
         logging.info(f"Раздача отправлена в чат {GIVEAWAY_CHAT_ID}, ID: {claim_id}")
         
-        # Также уведомляем админов об успешной отправке
         for admin_id in ADMIN_IDS:
             try:
                 await bot.send_message(
                     admin_id,
-                    f"✅ <b>Раздача успешно отправлена</b>\n"
-                    f"📋 ID раздачи: <code>{claim_id}</code>\n"
-                    f"📍 Чат: <code>{GIVEAWAY_CHAT_ID}</code>"
+                    f"✅ <b>Раздача отправлена</b>\n"
+                    f"Код: <code>{claim_id}</code>"
                 )
             except:
                 pass
-                
     except Exception as e:
-        error_text = f"❌ Ошибка при отправке раздачи в чат {GIVEAWAY_CHAT_ID}: {e}"
-        logging.error(error_text)
-        
-        # Уведомляем админов об ошибке
-        for admin_id in ADMIN_IDS:
-            try:
-                await bot.send_message(admin_id, f"❌ <b>Ошибка раздачи</b>\n\n{error_text}")
-            except:
-                pass
+        logging.error(f"Ошибка отправки раздачи: {e}")
 
 @dp.callback_query(F.data.startswith("claim_"))
 async def process_claim(callback: CallbackQuery):
@@ -528,46 +1196,31 @@ async def process_claim(callback: CallbackQuery):
     claim_id = callback.data.split("_")[1]
     user_id = callback.from_user.id
 
-    # Проверяем, существует ли такая раздача и не забрана ли она
     if claim_id not in active_claims:
-        await callback.answer("❌ Эта раздача уже закончилась или недействительна.", show_alert=True)
+        await callback.answer("❌ Раздача закончилась", show_alert=True)
         return
 
     if active_claims[claim_id] is not None:
-        # Кто-то уже забрал
-        await callback.answer("🍪 К сожалению, печеньку уже забрали. Повезёт в следующий раз!", show_alert=True)
+        await callback.answer("🍪 Печеньку уже забрали", show_alert=True)
         return
 
-    # Забираем печеньку
     active_claims[claim_id] = user_id
     user_data = get_user(user_id)
     new_balance = user_data.get('balance', 0) + 5
     user_data['balance'] = new_balance
+    user_data['total_earned'] = user_data.get('total_earned', 0) + 5
     update_user(user_id, user_data)
 
     await callback.message.edit_text(
-        f"🎉 <b>ПОЗДРАВЛЯЮ, {callback.from_user.full_name}!</b>\n"
+        f"{premium_emoji('prize')} <b>ПОЗДРАВЛЯЮ, {callback.from_user.full_name}!</b>\n"
         f"➖➖➖➖➖➖➖➖➖➖\n\n"
-        f"🍪 Ты успел первым и получил <b>+5 печенек</b>!\n"
-        f"💰 Теперь в твоём мешке: <b>{new_balance} 🍪</b>\n"
+        f"{premium_emoji('dice')} Ты получил <b>+5 печенек</b>!\n"
+        f"{premium_emoji('balance')} Баланс: <b>{new_balance} 🍪</b>\n"
         f"➖➖➖➖➖➖➖➖➖➖"
     )
-    await callback.answer("✅ Ты получил 5 печенек!", show_alert=True)
-    
-    # Уведомляем админов о том, кто получил печеньку
-    for admin_id in ADMIN_IDS:
-        try:
-            await bot.send_message(
-                admin_id,
-                f"🍪 <b>Печеньку получил!</b>\n\n"
-                f"👤 Пользователь: {callback.from_user.full_name}\n"
-                f"🆔 ID: <code>{user_id}</code>\n"
-                f"💰 Текущий баланс: {new_balance} 🍪"
-            )
-        except:
-            pass
+    await callback.answer("✅ +5 печенек!", show_alert=True)
 
-# ==== Админка ====
+# ==== Админка (БЕЗ ПРЕМИУМ ЭМОДЗИ) ====
 def is_admin(user_id: int) -> bool:
     """Проверка, является ли пользователь админом."""
     return user_id in ADMIN_IDS
@@ -576,17 +1229,16 @@ def is_admin(user_id: int) -> bool:
 async def admin_panel(message: Message):
     """Панель администратора."""
     if not is_admin(message.from_user.id):
-        await message.answer("⛔ <b>Доступ запрещён.</b>\n\n<i>Эта команда только для администраторов.</i>")
+        await message.answer("❌ <b>Доступ запрещён.</b>")
         return
 
     text = (
-        f"👑 <b>ПАНЕЛЬ АДМИНИСТРАТОРА</b>\n"
-        f"➖➖➖➖➖➖➖➖➖➖\n\n"
-        f"<b>Выберите действие:</b>\n"
-        f"➖➖➖➖➖➖➖➖➖➖"
+        "👑 <b>ПАНЕЛЬ АДМИНИСТРАТОРА</b>\n"
+        "➖➖➖➖➖➖➖➖➖➖\n\n"
+        "<b>Выберите действие:</b>"
     )
     builder = InlineKeyboardBuilder()
-    builder.button(text="📢 Сделать рассылку", callback_data="admin_broadcast")
+    builder.button(text="📢 Рассылка", callback_data="admin_broadcast")
     builder.button(text="💰 Изменить баланс", callback_data="admin_change_balance")
     builder.button(text="🔄 Сбросить баланс", callback_data="admin_reset_balance")
     builder.button(text="📊 Статистика", callback_data="admin_stats")
@@ -607,8 +1259,7 @@ async def admin_actions(callback: CallbackQuery, state: FSMContext):
     if action == "admin_broadcast":
         await callback.message.edit_text(
             "📢 <b>Создание рассылки</b>\n\n"
-            "Введите текст для рассылки всем пользователям:\n"
-            "<i>(можно использовать HTML-разметку)</i>"
+            "Введите текст для рассылки (можно использовать HTML-разметку):"
         )
         await state.set_state(AdminStates.waiting_for_broadcast)
         await callback.answer()
@@ -616,7 +1267,7 @@ async def admin_actions(callback: CallbackQuery, state: FSMContext):
     elif action == "admin_change_balance":
         await callback.message.edit_text(
             "💰 <b>Изменение баланса</b>\n\n"
-            "Введите ID пользователя, которому хотите изменить баланс:"
+            "Введите ID пользователя:"
         )
         await state.set_state(AdminStates.waiting_for_user_id_balance)
         await callback.answer()
@@ -624,81 +1275,206 @@ async def admin_actions(callback: CallbackQuery, state: FSMContext):
     elif action == "admin_reset_balance":
         await callback.message.edit_text(
             "🔄 <b>Сброс баланса</b>\n\n"
-            "Введите ID пользователя для сброса баланса:"
+            "Введите ID пользователя:"
         )
         await state.set_state(AdminStates.waiting_for_user_id_reset)
         await callback.answer()
 
     elif action == "admin_stats":
         db = get_all_users()
+        checks = load_checks()
         total_users = len(db)
         total_cookies = sum(u.get('balance', 0) for u in db.values())
-        avg_cookies = total_cookies / max(total_users, 1)
-        
-        # Подсчет пользователей с балансом > 0
         active_users = sum(1 for u in db.values() if u.get('balance', 0) > 0)
+        total_checks = len(checks)
+        active_checks = sum(1 for c in checks.values() if c.get('active', False))
         
         await callback.message.edit_text(
             f"📊 <b>СТАТИСТИКА БОТА</b>\n"
             f"➖➖➖➖➖➖➖➖➖➖\n\n"
             f"👥 <b>Всего пользователей:</b> <code>{total_users}</code>\n"
-            f"✨ <b>Активных пользователей:</b> <code>{active_users}</code>\n"
-            f"🍪 <b>Всего печенек:</b> <code>{total_cookies}</code>\n"
-            f"📈 <b>Среднее печенек:</b> <code>{avg_cookies:.1f}</code>\n"
+            f"👤 <b>Активных:</b> <code>{active_users}</code>\n"
+            f"💰 <b>Всего печенек:</b> <code>{total_cookies}</code>\n"
+            f"🧾 <b>Всего чеков:</b> <code>{total_checks}</code>\n"
+            f"🎁 <b>Активных чеков:</b> <code>{active_checks}</code>\n"
             f"➖➖➖➖➖➖➖➖➖➖",
             reply_markup=back_button_keyboard()
         )
         await callback.answer()
 
     elif action == "admin_test_giveaway":
-        await send_cookie_giveaway()  # Отправляем тестовую раздачу
+        await send_cookie_giveaway()
         await callback.message.edit_text(
-            f"✅ <b>Тестовая раздача отправлена</b>\n\n"
-            f"📍 Чат: <code>{GIVEAWAY_CHAT_ID}</code>\n"
-            f"➖➖➖➖➖➖➖➖➖➖",
+            "✅ <b>Тестовая раздача отправлена</b>",
             reply_markup=back_button_keyboard()
         )
         await callback.answer()
 
-    else:
-        await callback.answer()
-
-# Рассылка
+# ==== Рассылка с поддержкой кнопок (БЕЗ ПРЕМИУМ ЭМОДЗИ) ====
 @dp.message(AdminStates.waiting_for_broadcast)
-async def process_broadcast(message: Message, state: FSMContext):
-    """Обработка текста рассылки и отправка."""
+async def process_broadcast_text(message: Message, state: FSMContext):
+    """Обработка текста рассылки."""
     if not is_admin(message.from_user.id):
         await state.clear()
         return
 
     broadcast_text = message.text
+    
+    # Сохраняем текст в состоянии
+    await state.update_data(broadcast_text=broadcast_text)
+    
+    # Предлагаем выбрать тип кнопок
+    await message.answer(
+        "⚙️ <b>Настройка кнопок рассылки</b>\n\n"
+        f"Текст рассылки:\n<blockquote>{broadcast_text}</blockquote>\n\n"
+        f"Выберите тип кнопок для рассылки:",
+        reply_markup=broadcast_buttons_keyboard()
+    )
+    await state.set_state(AdminStates.waiting_for_broadcast_buttons)
+
+@dp.callback_query(AdminStates.waiting_for_broadcast_buttons)
+async def process_broadcast_buttons(callback: CallbackQuery, state: FSMContext):
+    """Обработка выбора кнопок для рассылки."""
+    if not is_admin(callback.from_user.id):
+        await callback.answer("⛔ Доступ запрещён", show_alert=True)
+        await state.clear()
+        return
+
+    action = callback.data
+    
+    if action == "broadcast_cancel":
+        await callback.message.edit_text(
+            "ℹ️ <b>Рассылка отменена</b>",
+            reply_markup=back_button_keyboard()
+        )
+        await state.clear()
+        await callback.answer()
+        return
+
+    data = await state.get_data()
+    broadcast_text = data.get('broadcast_text', '')
+    
+    if action == "broadcast_no_buttons":
+        # Отправляем без кнопок
+        await send_broadcast(callback.message, broadcast_text, None, state)
+    
+    elif action == "broadcast_one_button":
+        await callback.message.edit_text(
+            "🔗 <b>Создание кнопки</b>\n\n"
+            f"Введите текст и ссылку для кнопки в формате:\n"
+            f"<code>Текст кнопки | https://ссылка.ру</code>\n\n"
+            f"Пример: <code>Перейти в канал | {CHANNEL_LINK}</code>"
+        )
+        await state.set_state(AdminStates.waiting_for_broadcast_buttons)
+        await state.update_data(button_type="one")
+        await callback.answer()
+    
+    elif action == "broadcast_two_buttons":
+        await callback.message.edit_text(
+            "🔗 <b>Создание двух кнопок</b>\n\n"
+            f"Введите текст и ссылку для каждой кнопки в формате:\n"
+            f"<code>Кнопка 1 | ссылка1</code>\n"
+            f"<code>Кнопка 2 | ссылка2</code>\n\n"
+            f"Пример:\n"
+            f"<code>Канал | {CHANNEL_LINK}</code>\n"
+            f"<code>Поддержка | {SUPPORT_LINK}</code>"
+        )
+        await state.set_state(AdminStates.waiting_for_broadcast_buttons)
+        await state.update_data(button_type="two")
+        await callback.answer()
+    
+    elif action == "broadcast_three_buttons":
+        await callback.message.edit_text(
+            "🔗 <b>Создание трех кнопок</b>\n\n"
+            f"Введите текст и ссылку для каждой кнопки в формате:\n"
+            f"<code>Кнопка 1 | ссылка1</code>\n"
+            f"<code>Кнопка 2 | ссылка2</code>\n"
+            f"<code>Кнопка 3 | ссылка3</code>\n\n"
+            f"Каждая кнопка с новой строки!"
+        )
+        await state.set_state(AdminStates.waiting_for_broadcast_buttons)
+        await state.update_data(button_type="three")
+        await callback.answer()
+
+@dp.message(AdminStates.waiting_for_broadcast_buttons)
+async def process_broadcast_buttons_text(message: Message, state: FSMContext):
+    """Обработка текста с кнопками."""
+    if not is_admin(message.from_user.id):
+        await state.clear()
+        return
+
+    data = await state.get_data()
+    button_type = data.get('button_type')
+    broadcast_text = data.get('broadcast_text', '')
+    
+    lines = message.text.strip().split('\n')
+    buttons = []
+    
+    try:
+        if button_type == "one" and len(lines) >= 1:
+            btn_text, url = lines[0].split('|')
+            buttons.append((btn_text.strip(), url.strip()))
+        elif button_type == "two" and len(lines) >= 2:
+            for line in lines[:2]:
+                btn_text, url = line.split('|')
+                buttons.append((btn_text.strip(), url.strip()))
+        elif button_type == "three" and len(lines) >= 3:
+            for line in lines[:3]:
+                btn_text, url = line.split('|')
+                buttons.append((btn_text.strip(), url.strip()))
+        else:
+            await message.answer(
+                "❌ <b>Ошибка</b>\n\n"
+                f"Неверный формат или количество кнопок. Попробуйте снова."
+            )
+            return
+        
+        # Создаем клавиатуру
+        builder = InlineKeyboardBuilder()
+        for btn_text, url in buttons:
+            builder.button(text=btn_text, url=url)
+        builder.adjust(1)
+        keyboard = builder.as_markup() if buttons else None
+        
+        # Отправляем рассылку
+        await send_broadcast(message, broadcast_text, keyboard, state)
+        
+    except Exception as e:
+        await message.answer(
+            f"❌ <b>Ошибка</b>\n\n"
+            f"Неверный формат. Используйте: Текст | https://ссылка\n"
+            f"Ошибка: {str(e)}"
+        )
+
+async def send_broadcast(message: Message, text: str, keyboard: Optional[InlineKeyboardMarkup], state: FSMContext):
+    """Отправляет рассылку всем пользователям."""
     status_msg = await message.answer(
-        f"📢 <b>Начинаю рассылку...</b>\n\n"
-        f"<b>Текст:</b>\n<blockquote>{broadcast_text}</blockquote>"
+        "📢 <b>Начинаю рассылку...</b>"
     )
 
     db = get_all_users()
     sent = 0
     failed = 0
+    
     for user_id_str in db.keys():
         try:
-            await bot.send_message(int(user_id_str), broadcast_text)
+            await bot.send_message(int(user_id_str), text, reply_markup=keyboard, parse_mode=ParseMode.HTML)
             sent += 1
-            if sent % 10 == 0:  # Обновляем статус каждые 10 отправок
+            if sent % 10 == 0:
                 await status_msg.edit_text(
-                    f"📢 <b>Рассылка в процессе...</b>\n\n"
-                    f"✅ Отправлено: <code>{sent}</code>\n"
-                    f"❌ Ошибок: <code>{failed}</code>"
+                    f"📢 <b>Рассылка...</b>\n"
+                    f"✅ Отправлено: {sent}\n"
+                    f"❌ Ошибок: {failed}"
                 )
-            await asyncio.sleep(0.05)  # Небольшая задержка, чтобы не спамить
+            await asyncio.sleep(0.05)
         except Exception as e:
             failed += 1
-            logging.error(f"Не удалось отправить пользователю {user_id_str}: {e}")
+            logging.error(f"Ошибка отправки пользователю {user_id_str}: {e}")
 
     await status_msg.edit_text(
-        f"📢 <b>Рассылка завершена</b>\n\n"
-        f"✅ <b>Успешно отправлено:</b> <code>{sent}</code>\n"
-        f"❌ <b>Ошибок доставки:</b> <code>{failed}</code>"
+        f"✅ <b>Рассылка завершена</b>\n"
+        f"✅ Отправлено: {sent}\n"
+        f"❌ Ошибок: {failed}"
     )
     await state.clear()
 
@@ -708,17 +1484,16 @@ async def process_user_id_for_balance(message: Message, state: FSMContext):
     """Запрос суммы для изменения баланса."""
     try:
         user_id = int(message.text.strip())
-        # Проверяем, есть ли такой пользователь
-        get_user(user_id)  # Создаст, если нет
+        get_user(user_id)
         await state.update_data(target_user_id=user_id)
         await message.answer(
             f"💰 <b>Изменение баланса</b>\n\n"
-            f"🆔 Пользователь: <code>{user_id}</code>\n"
-            f"Введите сумму изменения (например: <code>+5</code> или <code>-3</code>):"
+            f"Пользователь: <code>{user_id}</code>\n"
+            f"Введите сумму (+5 или -3):"
         )
         await state.set_state(AdminStates.waiting_for_balance_amount)
     except ValueError:
-        await message.answer("❌ <b>Ошибка</b>\n\nНекорректный ID. Введите число.")
+        await message.answer("❌ <b>Ошибка</b>\n\nНекорректный ID.")
 
 @dp.message(AdminStates.waiting_for_balance_amount)
 async def process_balance_amount(message: Message, state: FSMContext):
@@ -730,17 +1505,14 @@ async def process_balance_amount(message: Message, state: FSMContext):
 
         user_data = get_user(user_id)
         current = user_data.get('balance', 0)
-        new_balance = current + amount
-        if new_balance < 0:
-            new_balance = 0
+        new_balance = max(0, current + amount)
         user_data['balance'] = new_balance
         update_user(user_id, user_data)
 
         await message.answer(
             f"✅ <b>Баланс изменен</b>\n\n"
-            f"👤 Пользователь: <code>{user_id}</code>\n"
-            f"📊 Было: <code>{current} 🍪</code>\n"
-            f"📈 Стало: <code>{new_balance} 🍪</code>"
+            f"Было: {current} 🍪\n"
+            f"Стало: {new_balance} 🍪"
         )
     except ValueError:
         await message.answer("❌ <b>Ошибка</b>\n\nНекорректная сумма.")
@@ -759,8 +1531,7 @@ async def process_reset_balance(message: Message, state: FSMContext):
         update_user(user_id, user_data)
         await message.answer(
             f"✅ <b>Баланс сброшен</b>\n\n"
-            f"👤 Пользователь: <code>{user_id}</code>\n"
-            f"📊 Предыдущий баланс: <code>{old_balance} 🍪</code>"
+            f"Было: {old_balance} 🍪"
         )
     except ValueError:
         await message.answer("❌ <b>Ошибка</b>\n\nНекорректный ID.")
@@ -768,11 +1539,13 @@ async def process_reset_balance(message: Message, state: FSMContext):
         await state.clear()
 
 # ==== Планировщик ====
+async def scheduled_task():
+    """Задача, которая выполняется по расписанию."""
+    await send_cookie_giveaway()
+
 async def scheduler():
     """Запуск планировщика для рассылки раз в час."""
-    aioschedule.every().hour.at(":00").do(send_cookie_giveaway)  # Каждый час в 00 минут
-    # Для теста можно чаще, например, каждые 10 минут:
-    # aioschedule.every(10).minutes.do(send_cookie_giveaway)
+    aioschedule.every().hour.at(":00").do(scheduled_task)
     while True:
         await aioschedule.run_pending()
         await asyncio.sleep(1)
@@ -780,35 +1553,34 @@ async def scheduler():
 # ==== Запуск бота ====
 async def on_startup():
     """Действия при запуске."""
-    # Создаем базу, если нет
     if not os.path.exists(DB_FILE):
         save_db({})
+    if not os.path.exists(CHECKS_FILE):
+        save_checks({})
     
-    # Проверяем доступность чата для раздач
     try:
         chat = await bot.get_chat(GIVEAWAY_CHAT_ID)
+        bot_username = (await bot.get_me()).username
         logging.info(f"✅ Чат для раздач доступен: {chat.title}")
+        logging.info(f"✅ Бот: @{bot_username}")
         
-        # Отправляем уведомление админам о запуске
         for admin_id in ADMIN_IDS:
             try:
                 await bot.send_message(
                     admin_id,
-                    f"🚀 <b>Бот успешно запущен!</b>\n\n"
-                    f"📊 <b>Статус:</b>\n"
-                    f"• Чат для раздач: <code>{chat.title}</code>\n"
-                    f"• Планировщик: активен\n"
-                    f"• База данных: загружена"
+                    f"{premium_emoji('rocket')} <b>Бот запущен!</b>\n\n"
+                    f"{premium_emoji('check')} Система чеков активна (только в личке)\n"
+                    f"{premium_emoji('prize')} Планировщик раздач запущен\n"
+                    f"🔗 Поддержка кнопок в рассылках"
                 )
             except:
                 pass
     except Exception as e:
-        logging.error(f"❌ Не удалось получить доступ к чату {GIVEAWAY_CHAT_ID}: {e}")
-        logging.error("Убедитесь, что бот добавлен в чат и является администратором!")
+        logging.error(f"❌ Ошибка доступа к чату: {e}")
     
     # Запускаем планировщик в фоне
     asyncio.create_task(scheduler())
-    logging.info("Бот запущен и планировщик активен.")
+    logging.info("Бот запущен")
 
 async def main():
     """Главная функция."""
