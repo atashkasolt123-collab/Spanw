@@ -1,2 +1,2 @@
 aiogram==3.13.1
-aioschedule==0.6.0
+aioschedule==0.5.2
