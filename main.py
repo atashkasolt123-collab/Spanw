@@ -471,7 +471,7 @@ def get_mines_multiplier(mines_count: int, opened_cells: int):
     return 1.02
 
 # Обработчики команд
-@dp.message(CommandStart())
+    @dp.message(CommandStart())
 async def cmd_start(message: types.Message, command: CommandStart):
     user_id = message.from_user.id
     username = message.from_user.username or "NoUsername"
@@ -491,113 +491,71 @@ async def cmd_start(message: types.Message, command: CommandStart):
     create_user(user_id, username, first_name, referrer_id)
     
     if message.chat.type != "private":
+        # ДЛЯ ЧАТОВ - ТОЛЬКО КНОПКИ ПОД СООБЩЕНИЕМ (НЕ INLINE)
         await message.answer(
             f"{premium_emoji(PREMIUM_EMOJIS['win'], '👏')} Бот работает!"
         )
+        
+        # Отправляем второе сообщение с обычными кнопками (не inline)
+        keyboard = ReplyKeyboardMarkup(
+            keyboard=[
+                [KeyboardButton(text="Играть"), KeyboardButton(text="Игровые чаты")],
+                [KeyboardButton(text="Профиль"), KeyboardButton(text="Реф. Программа")]
+            ],
+            resize_keyboard=True,
+            input_field_placeholder="Выберите действие..."
+        )
+        
+        await message.answer(
+            f"{premium_emoji(PREMIUM_EMOJIS['win'], '👏')} Привет, добро пожаловать в Plays.\n\n"
+            f"Подписывайся на наш канал, чтобы следить за новостями и конкурсами.",
+            reply_markup=keyboard
+        )
         return
     
+    # ДЛЯ ЛИЧКИ - Inline клавиатура
     # Первое сообщение
     await message.answer(
         f"{premium_emoji(PREMIUM_EMOJIS['win'], '👏')} Привет."
     )
     
-    # Второе сообщение с меню
+    # Второе сообщение с inline меню
     await message.answer(
         f"{premium_emoji(PREMIUM_EMOJIS['win'], '👏')} <b>Привет, добро пожаловать в Plays.</b>\n\n"
         f"📢 Подписывайся на наш канал, чтобы следить за новостями и конкурсами.",
         reply_markup=main_menu_keyboard()
     )
 
-@dp.message(Command("menu"))
-async def cmd_menu(message: types.Message):
-    if message.chat.type != "private":
+# Обработчик для обычных кнопок в чатах
+@dp.message(F.text == "Играть")
+async def chat_play(message: types.Message):
+    if message.chat.type == "private":
         return
-    await message.answer(
-        f"{premium_emoji(PREMIUM_EMOJIS['win'], '👏')} <b>Главное меню</b>",
-        reply_markup=main_menu_keyboard()
-    )
+    await message.answer("🎮 Выбирайте игру!", reply_markup=games_menu_keyboard())
 
-@dp.message(Command("games"))
-async def cmd_games(message: types.Message):
-    if message.chat.type != "private":
+@dp.message(F.text == "Игровые чаты")
+async def chat_chats(message: types.Message):
+    if message.chat.type == "private":
         return
-    balance = get_balance(message.from_user.id)
-    await message.answer(
-        f"{premium_emoji(PREMIUM_EMOJIS['game'], '🎮')} <b>Выбирайте игру или режим!</b>\n\n"
-        f"{premium_emoji(PREMIUM_EMOJIS['balance'], '💰')} Баланс — {balance:.2f}$\n"
-        f"{premium_emoji(PREMIUM_EMOJIS['bet'], '🎯')} Ставка — /bet сумма\n\n"
-        f"✨ Пополняй и играй!",
-        reply_markup=games_menu_keyboard()
-    )
+    await message.answer("💬 Игровые чаты", reply_markup=game_chats_keyboard())
 
-@dp.message(Command("play"))
-async def cmd_play(message: types.Message):
-    if message.chat.type != "private":
+@dp.message(F.text == "Профиль")
+async def chat_profile(message: types.Message):
+    if message.chat.type == "private":
         return
-    balance = get_balance(message.from_user.id)
-    await message.answer(
-        f"{premium_emoji(PREMIUM_EMOJIS['game'], '🎮')} <b>Выбирайте игру или режим!</b>\n\n"
-        f"{premium_emoji(PREMIUM_EMOJIS['balance'], '💰')} Баланс — {balance:.2f}$\n"
-        f"{premium_emoji(PREMIUM_EMOJIS['bet'], '🎯')} Ставка — /bet сумма\n\n"
-        f"✨ Пополняй и играй!",
-        reply_markup=games_menu_keyboard()
-    )
-
-@dp.message(Command("telegram"))
-async def cmd_telegram(message: types.Message):
-    if message.chat.type != "private":
-        return
-    balance = get_balance(message.from_user.id)
-    await message.answer(
-        f"{premium_emoji('5258508428212445001', '6⃣')} <b>Выберите режим игры!</b>\n\n"
-        f"{premium_emoji(PREMIUM_EMOJIS['balance'], '💰')} Баланс — {balance:.2f}$\n"
-        f"{premium_emoji(PREMIUM_EMOJIS['bet'], '🎯')} Ставка — /bet сумма\n\n"
-        f"✨ Пополняй и играй!",
-        reply_markup=telegram_games_keyboard()
-    )
-
-@dp.message(Command("avtor"))
-async def cmd_avtor(message: types.Message):
-    if message.chat.type != "private":
-        return
-    balance = get_balance(message.from_user.id)
-    await message.answer(
-        f"{premium_emoji(PREMIUM_EMOJIS['casino'], '🐳')} <b>Выбирайте авторскую игру!</b>\n\n"
-        f"{premium_emoji(PREMIUM_EMOJIS['balance'], '💰')} Баланс — {balance:.2f}$\n"
-        f"{premium_emoji(PREMIUM_EMOJIS['bet'], '🎯')} Ставка — /bet сумма\n\n"
-        f"✨ Пополняй и играй!",
-        reply_markup=custom_games_keyboard()
-    )
-
-@dp.message(Command("mines"))
-async def cmd_mines(message: types.Message, state: FSMContext):
-    if message.chat.type != "private":
-        return
-    balance = get_balance(message.from_user.id)
-    data = await state.get_data()
-    mines_count = data.get('mines_count', 3)
+    user_id = message.from_user.id
+    balance, total_bet, games_played = get_user_stats(user_id)
     
     await message.answer(
-        f"{premium_emoji(PREMIUM_EMOJIS['mine'], '💣')} <b>Мины</b>\n\n"
-        f"{premium_emoji(PREMIUM_EMOJIS['user'], '👤')} {message.from_user.first_name}\n"
-        f"{premium_emoji(PREMIUM_EMOJIS['balance'], '💰')} Баланс — {balance:.2f}$\n"
-        f"{premium_emoji(PREMIUM_EMOJIS['bet'], '🎯')} Ставка — /bet сумма\n\n"
-        f"{premium_emoji(PREMIUM_EMOJIS['mine'], '💣')} <b>Выбрано — {mines_count} 💣</b>",
-        reply_markup=mines_menu_keyboard()
+        f"{premium_emoji(PREMIUM_EMOJIS['user'], '👤')} <b>#{user_id} | {message.from_user.first_name}</b>\n\n"
+        f"{premium_emoji(PREMIUM_EMOJIS['balance'], '💰')} Баланс — {balance:.2f}$\n\n"
+        f"{premium_emoji(PREMIUM_EMOJIS['stats'], '📊')} Оборот — {total_bet:.2f}$\n"
+        f"{premium_emoji(PREMIUM_EMOJIS['game'], '🎮')} Сыграно — {games_played} ставки"
     )
 
-@dp.message(Command("chat"))
-async def cmd_chat(message: types.Message):
-    if message.chat.type != "private":
-        return
-    await message.answer(
-        f"{premium_emoji(PREMIUM_EMOJIS['game'], '💬')} <b>Игровые чаты</b> — это отличное место, чтобы найти друзей, обсудить игру или поднять денег в конкурсах и раздачах!",
-        reply_markup=game_chats_keyboard()
-    )
-
-@dp.message(Command("ref"))
-async def cmd_ref(message: types.Message):
-    if message.chat.type != "private":
+@dp.message(F.text == "Реф. Программа")
+async def chat_ref(message: types.Message):
+    if message.chat.type == "private":
         return
     user_id = message.from_user.id
     referrals = get_referrals_info(user_id)
@@ -615,7 +573,7 @@ async def cmd_ref(message: types.Message):
         f"$0.00"
     )
     
-    await message.answer(text, reply_markup=referral_keyboard())
+    await message.answer(text)
 
 @dp.message(Command("profile"))
 async def cmd_profile(message: types.Message):
